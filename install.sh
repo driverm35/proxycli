@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ProxyCLI installer for Ubuntu 24.04/26.04 and Debian 13.
-# Re-running keeps /etc/proxycli/state.json and does not touch SSH.
+# Re-running keeps /etc/proxycli/config.json and does not touch SSH.
 set -euo pipefail
 
 PROXYCLI_VERSION="1.0.0"
@@ -181,11 +181,23 @@ install_tree() {
 }
 
 install_dirs() {
-  install -d -m 0750 /etc/proxycli /etc/proxycli/caddy /etc/proxycli/3proxy
-  install -d -m 0750 /var/log/proxycli /var/lib/proxycli/backups
-  if [[ -f /etc/proxycli/state.json ]]; then
-    echo "Существующий /etc/proxycli/state.json сохранён."
+  install -d -m 0750 /etc/proxycli /var/log/proxycli /var/lib/proxycli/backups /var/lib/proxycli/deploy
+  if [[ -f /etc/proxycli/config.json ]]; then
+    echo "Существующий /etc/proxycli/config.json сохранён."
   fi
+}
+
+install_runtime_files() {
+  if [[ -f /var/lib/proxycli/deploy/compose.yaml ]]; then
+    echo "Существующий /var/lib/proxycli/deploy/compose.yaml сохранён."
+    return 0
+  fi
+  install -d -m 0750 /var/lib/proxycli/deploy/caddy /var/lib/proxycli/deploy/3proxy
+  install -m 0640 "${INSTALL_DIR}/deploy/compose.yaml" /var/lib/proxycli/deploy/compose.yaml
+  install -m 0640 "${INSTALL_DIR}/deploy/caddy/Caddyfile" /var/lib/proxycli/deploy/caddy/Caddyfile
+  install -m 0640 "${INSTALL_DIR}/deploy/caddy/Dockerfile" /var/lib/proxycli/deploy/caddy/Dockerfile
+  install -m 0750 "${INSTALL_DIR}/deploy/caddy/entrypoint.sh" /var/lib/proxycli/deploy/caddy/entrypoint.sh
+  install -m 0640 "${INSTALL_DIR}/deploy/3proxy/3proxy.cfg" /var/lib/proxycli/deploy/3proxy/3proxy.cfg
 }
 
 install_unit() {
@@ -206,7 +218,7 @@ report() {
   else
     echo "doctor: есть замечания. До proxycli wizard это ожидаемо."
   fi
-  echo "Повторный запуск не удаляет /etc/proxycli/state.json и не меняет SSH."
+  echo "Повторный запуск не удаляет /etc/proxycli/config.json и не меняет SSH."
 }
 
 launch_menu() {
@@ -237,6 +249,7 @@ main() {
   enable_docker
   install_tree
   install_dirs
+  install_runtime_files
   install_unit
   report
   launch_menu

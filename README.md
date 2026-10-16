@@ -31,13 +31,14 @@ curl -fsSL https://raw.githubusercontent.com/driverm35/proxycli/main/install.sh 
 sudo proxycli
 ```
 
-Повторный запуск `install.sh` не удаляет `/etc/proxycli/state.json`.
+Повторный запуск `install.sh` не удаляет `/etc/proxycli/config.json` и `/etc/proxycli/secrets.json`.
 
 Каталоги:
 
 - программа: `/opt/proxycli`
-- конфиг и секреты: `/etc/proxycli`
+- конфиг и секреты: `/etc/proxycli/config.json`, `/etc/proxycli/secrets.json`
 - журнал: `/var/log/proxycli`
+- рабочие файлы Docker: `/var/lib/proxycli/deploy`
 - резервные копии: `/var/lib/proxycli/backups`
 
 Проверка без установки:
@@ -140,14 +141,14 @@ sudo proxycli version
 sudo proxycli update --check
 sudo proxycli update --apply
 sudo bash /opt/proxycli/uninstall.sh
-sudo bash /opt/proxycli/uninstall.sh --purge-config
+sudo bash /opt/proxycli/uninstall.sh --purge --yes
 ```
 
 `doctor` ограничивает каждую проверку таймаутом. `update --apply` сначала
 делает резервную копию и не стирает маршруты и пароли. Откат файрвола удаляет
 только правила с меткой ProxyCLI и не выполняет `nft flush ruleset`.
 
-Без `--purge-config` каталог `/etc/proxycli` сохраняется. Docker Engine и SSH
+Без `--purge` каталог `/etc/proxycli` сохраняется. Docker Engine и SSH
 удаление не трогает.
 
 ## Если установка остановилась
