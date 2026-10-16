@@ -232,21 +232,61 @@ choose_docker_source
 
 
 @pytest.mark.skipif(BASH is None, reason="bash недоступен: функциональные проверки install.sh пропущены")
-def test_err_trap_reports_failing_command():
+def test_ensure_curl_installs_when_missing():
     script = _script("install.sh")
-    code, _stdout, stderr = _sourced(
+    code, stdout, stderr = _sourced(
         script,
         """
-proxycli_trap_fn() { false; }
-proxycli_trap_fn
+command() { return 1; }
+apt-get() { printf '%s\\n' "apt $*"; return 0; }
+ensure_curl
 """,
+    )
+    assert code == 0, stderr
+    assert "apt update" in stdout
+    assert "apt install -y ca-certificates curl" in stdout
+
+
+@pytest.mark.skipif(BASH is None, reason="bash недоступен: функциональные проверки install.sh пропущены")
+def test_ensure_curl_skips_when_present():
+    script = _script("install.sh")
+    code, stdout, stderr = _sourced(
+        script,
+        """
+command() { return 0; }
+apt-get() { printf '%s\\n' "apt-should-not-run"; return 1; }
+ensure_curl
+""",
+    )
+    assert code == 0, stderr
+    assert "apt-should-not-run" not in stdout
+
+
+@pytest.mark.skipif(BASH is None, reason="bash недоступен: функциональные проверки install.sh пропущены")
+def test_install_banner_accepts_leading_dashes():
+    script = _script("install.sh")
+    code, stdout, stderr = _sourced(script, 'install_banner "2026-01-01T00:00:00Z"')
+    assert code == 0, stderr
+    assert stdout.strip() == "---- proxycli install 2026-01-01T00:00:00Z ----"
+    assert "invalid option" not in stderr
+
+
+@pytest.mark.skipif(BASH is None, reason="bash недоступен: функциональные проверки install.sh пропущены")
+def test_err_trap_reports_failing_command():
+    script = _script("install.sh")
+    # Line 1 is `source`. `false` is line 3; the call on line 5 must not be reported.
+    code, _stdout, stderr = _sourced(
+        script,
+        "proxycli_trap_fn() {\n  false\n}\nproxycli_trap_fn\n",
     )
     assert code != 0
     assert "Ошибка установки" in stderr
     assert "Команда: false" in stderr
-    assert "Строка:" in stderr
+    assert "Строка: 3" in stderr
+    assert "Строка: 5" not in stderr
     assert "install.log" in stderr
-    assert "bash -x" in stderr
+    assert "bash -x /tmp/proxycli-install.sh" in stderr
+    assert "https://raw.githubusercontent.com/driverm35/proxycli/main/install.sh" in stderr
 
 
 @pytest.mark.skipif(BASH is None, reason="bash недоступен: проверка piped install.sh пропущена")

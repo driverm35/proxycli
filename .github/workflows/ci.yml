@@ -34,3 +34,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Installer dry-run
         run: bash install.sh --dry-run
+
+  piped-preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Piped dry-run on the runner
+        run: cat install.sh | sudo bash -s -- --dry-run
+      - name: Piped dry-run in Debian 13
+        run: docker run --rm -i debian:13 bash -s -- --dry-run < install.sh

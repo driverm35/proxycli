@@ -12,14 +12,21 @@ CADDY_IMAGE="caddy:2.11.7"
 THREEPROXY_IMAGE="3proxy/3proxy:0.9.9.1"
 DOCKER_CE_VERSION="29.8.2"
 INSTALL_LOG="/var/log/proxycli/install.log"
+# `curl | bash` never creates a local install.sh, so tracing that path fails.
+INSTALL_TRACE="curl -fsSL https://raw.githubusercontent.com/driverm35/proxycli/main/install.sh -o /tmp/proxycli-install.sh && sudo bash -x /tmp/proxycli-install.sh"
 
 err_status=0
 err_cmd=""
 err_line=0
 
+print_failure_hint() {
+  printf 'Диагностика: cat %s; journalctl -u docker.service --no-pager -n 50; повторный запуск с трассировкой: %s\n' \
+    "${INSTALL_LOG}" "${INSTALL_TRACE}" >&2
+}
+
 die() {
   printf 'Ошибка: %s\n' "$*" >&2
-  printf 'Диагностика: cat %s; journalctl -u docker.service --no-pager -n 50; повторный запуск с трассировкой: bash -x install.sh\n' "${INSTALL_LOG}" >&2
+  print_failure_hint
   exit 1
 }
 
@@ -34,24 +41,45 @@ on_err() {
   printf 'Ошибка установки ProxyCLI: команда завершилась с кодом %s.\n' "${status}" >&2
   printf 'Команда: %s\n' "${cmd}" >&2
   printf 'Строка: %s\n' "${line}" >&2
-  printf 'Диагностика: cat %s; journalctl -u docker.service --no-pager -n 50; повторный запуск с трассировкой: bash -x install.sh\n' "${INSTALL_LOG}" >&2
+  print_failure_hint
   exit "${status}"
 }
 
 # Capture BASH_COMMAND here. Inside on_err it may already be the trap body.
-trap 'err_status=$?; err_cmd="$BASH_COMMAND"; err_line="${BASH_LINENO[0]:-${LINENO}}"; trap - ERR; on_err' ERR
+# BASH_LINENO[0] is the caller of the current function, so a failure inside
+# setup_logging was reported as main's call. LINENO is the failing command.
+trap 'err_status=$?; err_cmd="$BASH_COMMAND"; err_line="${LINENO}"; trap - ERR; on_err' ERR
+
+# Bash builtin printf treats a format starting with "-" as an option.
+install_banner() {
+  local stamp="$1"
+  printf '%s\n' "---- proxycli install ${stamp} ----"
+}
+
+# >(tee) is not waited for on exit. A short failure then dies with the log
+# still sitting in tee's buffer, which is what a piped install hits first.
+finish_log() {
+  local status=$?
+  exec >&- 2>&- || true
+  wait || true
+  exit "${status}"
+}
 
 setup_logging() {
-  local log_dir="/var/log/proxycli"
+  local log_dir=""
+  local stamp=""
   if [[ "${PROXYCLI_INSTALL_LOG_READY:-}" == "1" ]]; then
     return 0
   fi
+  log_dir="$(dirname "${INSTALL_LOG}")"
   install -d -m 0750 "${log_dir}"
   touch "${INSTALL_LOG}"
   chmod 0640 "${INSTALL_LOG}"
+  trap finish_log EXIT
   exec > >(tee -a "${INSTALL_LOG}") 2>&1
   PROXYCLI_INSTALL_LOG_READY=1
-  printf '---- proxycli install %s ----\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ || true)"
+  stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+  install_banner "${stamp}"
 }
 
 check_os() {
@@ -101,6 +129,9 @@ check_arch() {
 }
 
 check_internet() {
+  if ! command -v curl >/dev/null 2>&1; then
+    die "curl не установлен, доступ к GitHub не проверен."
+  fi
   if ! curl -fsSL --max-time 20 -o /dev/null "https://github.com/driverm35/proxycli"; then
     die "Нет доступа к GitHub. Проверка: curl -I --max-time 20 https://github.com/driverm35/proxycli"
   fi
@@ -348,6 +379,15 @@ EOF
   print_installed_docker_version
 }
 
+ensure_curl() {
+  if command -v curl >/dev/null 2>&1; then
+    return 0
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y ca-certificates curl
+}
+
 install_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
@@ -421,7 +461,7 @@ install_unit() {
 }
 
 report() {
-  echo "---- ProxyCLI ${PROXYCLI_VERSION} ----"
+  printf '%s\n' "---- ProxyCLI ${PROXYCLI_VERSION} ----"
   echo "Caddy ${CADDY_IMAGE}"
   echo "3proxy ${THREEPROXY_IMAGE}"
   proxycli version || true
@@ -455,6 +495,7 @@ main() {
   setup_logging
   check_os
   check_arch
+  ensure_curl
   check_internet
   install_packages
   assert_port_free 80
