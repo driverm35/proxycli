@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from proxycli.constants import THREEPROXY_IMAGE
+from proxycli.constants import CADDY_IMAGE, THREEPROXY_IMAGE
 from proxycli.models.config import AppConfig, Listener, ProxyUser
 from proxycli.services.probes import http_proxy_status, socks5_connect, socks5_noauth_rejected
 from proxycli.services.proxy3cfg import render_3proxy
@@ -63,6 +63,82 @@ def test_docker_proxy_auth_and_ssrf(tmp_path: Path):
         assert metadata != 200
     finally:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+
+
+@pytest.mark.skipif(not _docker_ok(), reason="Docker недоступен: проверка caddy reload пропущена")
+def test_caddy_reload_address_is_ipv4_admin(tmp_path: Path):
+    caddyfile = tmp_path / "Caddyfile"
+    caddyfile.write_text("{\n\tadmin 127.0.0.1:2019\n}\n:80 {\n\trespond \"ok\" 200\n}\n", encoding="utf-8")
+    name = "proxycli-caddy-admin-proof"
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+    pull = subprocess.run(["docker", "pull", CADDY_IMAGE], capture_output=True, text=True, timeout=180)
+    if pull.returncode != 0:
+        pytest.skip(f"образ {CADDY_IMAGE} не скачан: {pull.stderr.strip()}")
+    mounted = f"{caddyfile.resolve().as_posix()}:/etc/caddy/Caddyfile:ro"
+    validate = subprocess.run(
+        [
+            "docker", "run", "--rm", "--network", "none",
+            "-v", mounted,
+            CADDY_IMAGE,
+            "caddy", "validate",
+            "--config", "/etc/caddy/Caddyfile",
+            "--adapter", "caddyfile",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert validate.returncode == 0, validate.stderr or validate.stdout
+    run = subprocess.run(
+        [
+            "docker", "run", "-d", "--name", name, "--network", "none",
+            "-v", mounted,
+            CADDY_IMAGE,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    try:
+        assert run.returncode == 0, run.stderr
+        ports = subprocess.run(["docker", "port", name], capture_output=True, text=True, timeout=20)
+        assert ports.stdout.strip() == ""
+        reloaded = _reload_until(name, ["--address", "127.0.0.1:2019"])
+        assert reloaded.returncode == 0, reloaded.stderr or reloaded.stdout
+        combined = f"{reloaded.stdout}\n{reloaded.stderr}"
+        assert "connection refused" not in combined
+        ipv6 = subprocess.run(
+            _reload_argv(name, ["--address", "[::1]:2019"]),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        ipv6_text = f"{ipv6.stdout}\n{ipv6.stderr}"
+        assert ipv6.returncode != 0
+        assert "connection refused" in ipv6_text
+        assert "[::1]:2019" in ipv6_text
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+
+
+def _reload_argv(name: str, extra: list[str]) -> list[str]:
+    return [
+        "docker", "exec", name, "caddy", "reload",
+        "--config", "/etc/caddy/Caddyfile",
+        "--adapter", "caddyfile",
+        *extra,
+    ]
+
+
+def _reload_until(name: str, extra: list[str]) -> subprocess.CompletedProcess[str]:
+    deadline = time.time() + 20
+    last = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="")
+    while time.time() < deadline:
+        last = subprocess.run(_reload_argv(name, extra), capture_output=True, text=True, timeout=30)
+        if last.returncode == 0:
+            return last
+        time.sleep(0.4)
+    return last
 
 
 def _published(name: str, container_port: str) -> int:

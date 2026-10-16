@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from proxycli.errors import ProxyCLIError
 from proxycli.managers.stack import Stack
-from proxycli.services.probes import detect_public_ipv4
+from proxycli.services.probes import check_name_dns, detect_public_ipv4, dns_not_saved_message
 from proxycli.ui.console import DNS_HELP, console
 from proxycli.ui.prompts import ask_confirm, ask_secret, ask_text, choose
+from proxycli.utils.validation import validate_domain, validate_email, validate_public_ipv4
 
 
 def run_wizard(stack: Stack | None = None) -> int:
@@ -34,9 +35,24 @@ def run_wizard(stack: Stack | None = None) -> int:
         if not token:
             out.print("Токен пуст. Режим B не сохранён.")
             return 1
-    accept = True
+    try:
+        ip_ok = validate_public_ipv4(ip)
+        zone = validate_domain(domain)
+        validate_email(email)
+    except ProxyCLIError as exc:
+        out.print(f"Ошибка: {exc}")
+        if exc.fix:
+            out.print(f"Что сделать: {exc.fix}")
+        return 1
+    accept = False
     if not stack.offline():
-        accept = ask_confirm("Продолжить, даже если проверка DNS не совпадёт?", default=False)
+        dns_ok, detail = check_name_dns(zone, ip_ok, timeout=5)
+        out.print(detail)
+        if not dns_ok:
+            accept = ask_confirm("Продолжить, даже если проверка DNS не совпадёт?", default=False)
+            if not accept:
+                out.print(dns_not_saved_message(zone, ip_ok, detail))
+                return 1
     try:
         warnings = stack.save_wizard(
             public_ip=ip,

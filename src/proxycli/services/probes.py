@@ -196,6 +196,15 @@ def probe_public_https(hostname: str, expected_ip: str, timeout: float) -> Probe
     return report
 
 
+def dns_not_saved_message(domain: str, public_ip: str, detail: str) -> str:
+    return (
+        "Проверка DNS не совпала. Домен не сохранён, Caddy не запускался и не изменялся. "
+        f"{detail} "
+        f"Создайте A-запись *.{domain} или proxycli-check.{domain} на {public_ip}. "
+        "После этого снова запустите sudo proxycli."
+    )
+
+
 def check_name_dns(domain: str, public_ip: str, timeout: float) -> tuple[bool, str]:
     name = f"proxycli-check.{domain}"
     try:

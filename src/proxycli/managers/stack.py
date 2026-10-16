@@ -3,7 +3,13 @@ from __future__ import annotations
 import os
 import uuid
 
-from proxycli.constants import CADDY_DNS_IMAGE, CADDY_DNS_MODULE, CADDY_IMAGE
+from proxycli.constants import (
+    CADDY_ADMIN,
+    CADDY_CONTAINER,
+    CADDY_DNS_IMAGE,
+    CADDY_DNS_MODULE,
+    CADDY_IMAGE,
+)
 from proxycli.errors import ProbeError, ProxyCLIError, RollbackError, ValidationError
 from proxycli.managers.backup import BackupManager
 from proxycli.models.config import AppConfig, ProxyUser, Route
@@ -14,7 +20,12 @@ from proxycli.services.caddyfile import (
 )
 from proxycli.services.compose import ENTRYPOINT, render_compose, render_dockerfile
 from proxycli.services.events import EventLog
-from proxycli.services.probes import check_name_dns, probe_public_https, probe_upstream
+from proxycli.services.probes import (
+    check_name_dns,
+    dns_not_saved_message,
+    probe_public_https,
+    probe_upstream,
+)
 from proxycli.services.proxy3cfg import render_3proxy
 from proxycli.services.store import Store, generate_password
 from proxycli.utils.files import atomic_write
@@ -70,7 +81,7 @@ class Stack:
         if self.offline():
             warnings.append("offline: Docker и публичный TLS не проверялись, успех не заявляется")
             return warnings
-        self._docker_validate_and_reload()
+        warnings.extend(self._docker_validate_and_reload())
         if probe and probe_hosts and not self._skip_probes():
             config = self.store.load()
             for host in probe_hosts:
@@ -101,7 +112,7 @@ class Stack:
             mutate()
             return self.reload(probe_hosts=probe_hosts, probe=probe)
         except Exception as exc:
-            self._rollback(snap, exc)
+            self._rollback(snap, exc, reason=reason)
             raise
 
     def save_wizard(
@@ -131,9 +142,9 @@ class Stack:
             dns_ok, detail = check_name_dns(zone, ip, timeout=5)
             if not dns_ok and not accept_dns:
                 raise ProbeError(
-                    f"Домен не сохранён: проверка DNS не совпала. {detail} Caddy не запускался.",
+                    dns_not_saved_message(zone, ip, detail),
                     layer="dns",
-                    fix="создайте A-запись на публичный IPv4 этого сервера и запустите мастер снова",
+                    fix="создайте A-запись на публичный IPv4 этого сервера и снова запустите sudo proxycli",
                 )
             if not dns_ok:
                 warnings.append(detail)
@@ -350,7 +361,7 @@ class Stack:
             )
         return ""
 
-    def _rollback(self, snap: str, original: Exception) -> None:
+    def _rollback(self, snap: str, original: Exception, *, reason: str = "") -> None:
         try:
             self.backup.restore(snap)
         except Exception as exc:
@@ -359,10 +370,13 @@ class Stack:
                 fix=f"proxycli backup restore --id {snap}",
             ) from original
         if isinstance(original, ProxyCLIError) and snap not in original.message:
-            original.message = (
-                f"{original.message} Файлы возвращены из копии {snap}; "
-                "повторное восстановление не обязательно."
+            restored = (
+                f"Файлы возвращены из копии {snap}; повторное восстановление не обязательно."
             )
+            if reason == "wizard" and "Домен не сохранён" not in original.message:
+                original.message = f"Домен не сохранён. {original.message} {restored}"
+            else:
+                original.message = f"{original.message} {restored}"
             if original.fix.startswith("proxycli backup restore"):
                 original.fix = ""
 
@@ -374,7 +388,7 @@ class Stack:
         atomic_write(self.layout.dockerfile, render_dockerfile(), 0o644)
         atomic_write(self.layout.entrypoint, ENTRYPOINT, 0o755)
 
-    def _docker_validate_and_reload(self) -> None:
+    def _docker_validate_and_reload(self) -> list[str]:
         config = self.store.load()
         image = CADDY_DNS_IMAGE if config.tls.mode == "dns" and config.tls.dns_plugin_ready else CADDY_IMAGE
         caddyfile = self.layout.caddyfile.resolve().as_posix()
@@ -393,25 +407,9 @@ class Stack:
             "caddyfile",
         ]
         require_ok(self.runner(validate, timeout=90), validate)
-        compose = [
-            "docker",
-            "compose",
-            "-f",
-            str(self.layout.compose_file),
-            "--project-directory",
-            str(self.layout.deploy_dir),
-            "up",
-            "-d",
-            "--remove-orphans",
-        ]
-        require_ok(self.runner(compose, timeout=180), compose)
-        reload = [
-            "docker",
-            "compose",
-            "-f",
-            str(self.layout.compose_file),
-            "--project-directory",
-            str(self.layout.deploy_dir),
+        up = self._compose("up", "-d", "--remove-orphans")
+        require_ok(self.runner(up, timeout=180), up)
+        reload = self._compose(
             "exec",
             "-T",
             "caddy",
@@ -421,8 +419,47 @@ class Stack:
             "/etc/caddy/Caddyfile",
             "--adapter",
             "caddyfile",
+            "--address",
+            CADDY_ADMIN,
+        )
+        reloaded = self.runner(reload, timeout=60)
+        if reloaded.ok:
+            return []
+        if _admin_not_listening(reloaded):
+            recreate = self._compose(
+                "up",
+                "-d",
+                "--force-recreate",
+                "--no-deps",
+                "--remove-orphans",
+                "caddy",
+            )
+            require_ok(self.runner(recreate, timeout=180), recreate)
+            state = self.container_state(CADDY_CONTAINER)
+            if state != "running":
+                raise ProxyCLIError(
+                    "контейнер Caddy не запущен после docker compose up -d "
+                    f"(состояние: {state})",
+                    fix="docker inspect proxycli-caddy",
+                )
+            return [
+                "Admin API Caddy не принимал подключения на 127.0.0.1:2019, "
+                "reload не засчитан. Контейнер перезапущен через docker compose up -d "
+                "с проверенным Caddyfile. Успех TLS не заявляется."
+            ]
+        require_ok(reloaded, reload)
+        return []
+
+    def _compose(self, *args: str) -> list[str]:
+        return [
+            "docker",
+            "compose",
+            "-f",
+            str(self.layout.compose_file),
+            "--project-directory",
+            str(self.layout.deploy_dir),
+            *args,
         ]
-        require_ok(self.runner(reload, timeout=60), reload)
 
     def _fail_step(self) -> str:
         if isinstance(self.runner, OfflineRunner):
@@ -453,6 +490,15 @@ class Stack:
         if not result.ok:
             return "неизвестно"
         return result.stdout.strip() or "неизвестно"
+
+
+def _admin_not_listening(result: ProcResult) -> bool:
+    text = f"{result.stdout}\n{result.stderr}".lower()
+    if "connection refused" in text or "actively refused" in text:
+        return True
+    if "is not running" in text or "no such container" in text:
+        return True
+    return "i/o timeout" in text or "context deadline exceeded" in text
 
 
 def _kind(kind: str) -> str:

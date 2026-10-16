@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from proxycli.constants import CADDY_ADMIN
 from proxycli.models.config import AppConfig, Route
 from proxycli.utils.validation import (
     upstream_host_port,
@@ -27,7 +28,7 @@ def render_caddyfile(config: AppConfig) -> tuple[str, list[str]]:
     lines: list[str] = ["{"]
     if config.tls.acme_email:
         lines.append(f"\temail {config.tls.acme_email}")
-    lines.append("\tadmin off")
+    lines.append(f"\tadmin {CADDY_ADMIN}")
     lines.append("}")
     lines.append("")
     enabled = [route for route in config.routes if route.enabled]

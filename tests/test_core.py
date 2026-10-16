@@ -326,6 +326,10 @@ def test_caddy_validate_argv_invokes_caddy(layout, monkeypatch):
     assert "--entrypoint" not in validate
     reload = next(call for call in runner.calls if "reload" in call)
     assert reload[reload.index("reload") - 1] == "caddy"
+    assert "--address" in reload
+    assert "127.0.0.1:2019" in reload
+    assert not any("localhost" in part for part in reload)
+    assert not any("--force-recreate" in part for call in runner.calls for part in call)
     modules = [call for call in runner.calls if "list-modules" in call]
     assert modules == []
 
@@ -371,8 +375,12 @@ def test_dns_decline_stops_before_docker(layout, monkeypatch):
             accept_dns=False,
             probe=True,
         )
-    assert "Домен не сохранён" in str(caught.value)
-    assert "Caddy не запускался" in str(caught.value)
+    text = str(caught.value)
+    assert "Домен не сохранён" in text
+    assert "Caddy не запускался" in text
+    assert "sudo proxycli" in text
+    assert "proxycli-check.hooks.example.com" in text
+    assert "docker" not in text
     assert runner.calls == []
     assert stack.store.load().wildcard_domain == ""
     assert stack.store.load().first_run_complete is False
@@ -408,14 +416,154 @@ def test_wizard_ui_dns_decline_does_not_start_caddy(layout, monkeypatch, capsys)
     monkeypatch.setattr("proxycli.ui.wizard.ask_confirm", lambda *_args, **_kwargs: False)
     monkeypatch.setattr("proxycli.ui.wizard.detect_public_ipv4", lambda *_args, **_kwargs: "")
     monkeypatch.setattr(
+        "proxycli.ui.wizard.check_name_dns",
+        lambda *_args, **_kwargs: (False, "имя не указывает на сервер"),
+    )
+    monkeypatch.setattr(
         "proxycli.managers.stack.check_name_dns",
         lambda *_args, **_kwargs: (False, "имя не указывает на сервер"),
     )
     assert run_wizard(stack) == 1
     captured = capsys.readouterr()
     assert "Домен не сохранён" in captured.out
+    assert "Caddy не запускался" in captured.out
+    assert "не изменялся" in captured.out
+    assert "sudo proxycli" in captured.out
+    assert "команда завершилась с ошибкой" not in captured.out
+    assert "docker compose" not in captured.out
     assert runner.calls == []
     assert stack.store.load().wildcard_domain == ""
+
+
+def test_wizard_dns_match_does_not_ask(layout, monkeypatch, capsys):
+    from proxycli.ui.wizard import run_wizard
+
+    runner = _RecordingRunner()
+    stack = _online_stack(layout, monkeypatch, runner)
+    answers = iter(["8.8.8.8", "hooks.example.com", "admin@example.com"])
+    monkeypatch.setattr("proxycli.ui.wizard.ask_text", lambda *_args, **_kwargs: next(answers))
+    monkeypatch.setattr("proxycli.ui.wizard.choose", lambda *_args, **_kwargs: "http")
+    monkeypatch.setattr("proxycli.ui.wizard.detect_public_ipv4", lambda *_args, **_kwargs: "")
+
+    def _forbid_confirm(*_args, **_kwargs):
+        raise AssertionError("вопрос DNS задан, хотя проверка совпала")
+
+    monkeypatch.setattr("proxycli.ui.wizard.ask_confirm", _forbid_confirm)
+    matched = (True, "proxycli-check.hooks.example.com указывает на 8.8.8.8")
+    monkeypatch.setattr("proxycli.ui.wizard.check_name_dns", lambda *_args, **_kwargs: matched)
+    monkeypatch.setattr("proxycli.managers.stack.check_name_dns", lambda *_args, **_kwargs: matched)
+    assert run_wizard(stack) == 0
+    captured = capsys.readouterr()
+    assert "Мастер сохранён" in captured.out
+    assert "Продолжить, даже если проверка DNS" not in captured.out
+    reload = next(call for call in runner.calls if "reload" in call)
+    assert "127.0.0.1:2019" in reload
+    assert not any("localhost" in part for part in reload)
+    assert stack.store.load().wildcard_domain == "hooks.example.com"
+
+
+def test_admin_down_restarts_without_rollback(layout, monkeypatch):
+    class _Runner:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def __call__(self, argv: list[str], timeout: float = 30) -> ProcResult:
+            self.calls.append(list(argv))
+            if "reload" in argv:
+                return ProcResult(1, "", "dial tcp 127.0.0.1:2019: connect: connection refused")
+            if argv[:2] == ["docker", "inspect"]:
+                return ProcResult(0, "running\n", "")
+            return ProcResult(0, "", "")
+
+    runner = _Runner()
+    stack = _online_stack(layout, monkeypatch, runner)
+    warnings = stack.save_wizard(
+        public_ip="8.8.8.8",
+        domain="hooks.example.com",
+        tls_mode="http",
+        acme_email="admin@example.com",
+        probe=False,
+    )
+    assert stack.store.load().wildcard_domain == "hooks.example.com"
+    assert stack.store.load().first_run_complete is True
+    assert any("reload не засчитан" in item for item in warnings)
+    reload = next(call for call in runner.calls if "reload" in call)
+    assert reload[reload.index("--address") + 1] == "127.0.0.1:2019"
+    assert not any("localhost" in part for part in reload)
+    assert any("--force-recreate" in call for call in runner.calls)
+
+
+def test_reload_failure_does_not_keep_domain(layout, monkeypatch, capsys):
+    from proxycli.ui.wizard import run_wizard
+
+    class _Runner:
+        def __call__(self, argv: list[str], timeout: float = 30) -> ProcResult:
+            if "reload" in argv:
+                return ProcResult(1, "", "Error: adapting config using caddyfile: bad token")
+            if argv[:2] == ["docker", "inspect"]:
+                return ProcResult(0, "running\n", "")
+            return ProcResult(0, "", "")
+
+    stack = _online_stack(layout, monkeypatch, _Runner())
+    answers = iter(["8.8.8.8", "hooks.example.com", "admin@example.com"])
+    monkeypatch.setattr("proxycli.ui.wizard.ask_text", lambda *_args, **_kwargs: next(answers))
+    monkeypatch.setattr("proxycli.ui.wizard.choose", lambda *_args, **_kwargs: "http")
+    monkeypatch.setattr("proxycli.ui.wizard.detect_public_ipv4", lambda *_args, **_kwargs: "")
+
+    def _forbid_confirm(*_args, **_kwargs):
+        raise AssertionError("вопрос DNS задан, хотя проверка совпала")
+
+    monkeypatch.setattr("proxycli.ui.wizard.ask_confirm", _forbid_confirm)
+    matched = (True, "proxycli-check.hooks.example.com указывает на 8.8.8.8")
+    monkeypatch.setattr("proxycli.ui.wizard.check_name_dns", lambda *_args, **_kwargs: matched)
+    monkeypatch.setattr("proxycli.managers.stack.check_name_dns", lambda *_args, **_kwargs: matched)
+    assert run_wizard(stack) == 1
+    captured = capsys.readouterr()
+    assert captured.out.count("Домен не сохранён") == 1
+    assert "Мастер сохранён" not in captured.out
+    assert "bad token" in captured.out
+    assert stack.store.load().wildcard_domain == ""
+    assert stack.store.load().first_run_complete is False
+
+
+def test_update_paths_use_opt_proxycli_venv(tmp_path):
+    from proxycli.managers.update import select_update_paths, update_path_candidates
+
+    app = tmp_path / "opt" / "proxycli"
+    app.mkdir(parents=True)
+    (app / ".git").mkdir()
+    (app / "pyproject.toml").write_text("[project]\nname = 'proxycli'\n", encoding="utf-8")
+    src = app / "src"
+    src.mkdir()
+    (src / ".git").mkdir()
+    (src / "pyproject.toml").write_text("nested\n", encoding="utf-8")
+    dot_pip = app / ".venv" / "bin" / "pip"
+    dot_pip.parent.mkdir(parents=True)
+    dot_pip.write_text("pip\n", encoding="utf-8")
+    old_pip = app / "venv" / "bin" / "pip"
+    old_pip.parent.mkdir(parents=True)
+    old_pip.write_text("old\n", encoding="utf-8")
+    etc = tmp_path / "etc" / "proxycli"
+    etc.mkdir(parents=True)
+    (etc / "config.json").write_text("keep\n", encoding="utf-8")
+    (etc / ".git").mkdir()
+    (etc / "pyproject.toml").write_text("nope\n", encoding="utf-8")
+
+    apps, pips = update_path_candidates(Path("/opt/proxycli/src"))
+    assert apps[0] == Path("/opt/proxycli")
+    assert apps[1] == Path("/opt/proxycli/src")
+    assert pips[0] == Path("/opt/proxycli/.venv/bin/pip")
+    assert pips.index(Path("/opt/proxycli/.venv/bin/pip")) < pips.index(Path("/opt/proxycli/venv/bin/pip"))
+
+    chosen_app, chosen_pip = select_update_paths(
+        [Path("/etc/proxycli"), app, src],
+        [dot_pip, old_pip],
+    )
+    assert chosen_app == app
+    assert chosen_pip == dot_pip
+    assert (etc / "config.json").read_text(encoding="utf-8") == "keep\n"
+    with pytest.raises(ProxyCLIError, match="не изменяет /etc/proxycli"):
+        select_update_paths([Path("/etc/proxycli")], [dot_pip])
 
 
 def test_backup_roundtrip(stack):
