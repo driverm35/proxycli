@@ -14,11 +14,18 @@ from proxycli.managers.stack import Stack
 from proxycli.models.config import AppConfig, Listener, ProxyUser, Route
 from proxycli.services.caddyfile import render_caddyfile
 from proxycli.services.compose import ENTRYPOINT, render_compose, render_dockerfile
+from proxycli.services.probes import LayerResult, ProbeReport, probe_upstream
 from proxycli.services.proxy3cfg import render_3proxy
 from proxycli.ui.console import CLEARTEXT_WARNING, curl_example
 from proxycli.ui.status import plain_status, unicode_disabled
 from proxycli.utils.proc import ProcResult, SubprocessRunner
-from proxycli.utils.validation import validate_domain, validate_subdomain, validate_upstream
+from proxycli.utils.validation import (
+    join_upstream_path,
+    upstream_rewrite_prefix,
+    validate_domain,
+    validate_subdomain,
+    validate_upstream,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -49,9 +56,362 @@ def test_rejects_injection():
     with pytest.raises(ValidationError):
         validate_upstream("https://example.com/$(id)")
     with pytest.raises(ValidationError):
+        validate_upstream("https://example.com/hook\n/admin")
+    with pytest.raises(ValidationError):
+        validate_upstream("https://user:pass@example.com/hook/")
+    with pytest.raises(ValidationError):
+        validate_upstream("https://example.com/%24(id)")
+    with pytest.raises(ValidationError):
         validate_domain("hooks.example.com`id`")
     with pytest.raises(ValidationError):
         SubprocessRunner()(["echo", "a\nb"])
+
+
+WEBHOOK_BASE = "/admin/admin_api/telegram/webhook"
+WEBHOOK_UPSTREAM = f"https://api.stage.dddevspace.ru{WEBHOOK_BASE}/"
+
+
+def test_upstream_accepts_base_path_and_port():
+    with pytest.raises(ValidationError, match="upstream должен начинаться с http:// или https://"):
+        validate_upstream("api.stage.dddevspace.ru/admin/admin_api/telegram/webhook/")
+    assert validate_upstream(WEBHOOK_UPSTREAM) == WEBHOOK_UPSTREAM
+    assert validate_upstream(WEBHOOK_UPSTREAM.rstrip("/")) == WEBHOOK_UPSTREAM.rstrip("/")
+    assert (
+        validate_upstream("https://API.Stage.dddevspace.ru:443/admin/admin_api/telegram/webhook/")
+        == WEBHOOK_UPSTREAM
+    )
+    assert validate_upstream("https://api.example.com:8443/hook") == "https://api.example.com:8443/hook"
+    assert validate_upstream("https://example.com/") == "https://example.com"
+    assert validate_upstream(validate_upstream(WEBHOOK_UPSTREAM)) == WEBHOOK_UPSTREAM
+    with pytest.raises(ValidationError, match="логин или пароль"):
+        validate_upstream("https://@example.com/hook")
+    with pytest.raises(ValidationError):
+        validate_upstream("https://bad_host.example/hook")
+    with pytest.raises(ValidationError, match="SSH"):
+        validate_upstream("https://example.com:22/hook")
+
+
+def test_join_upstream_path_slash_and_query():
+    for base in (WEBHOOK_BASE + "/", WEBHOOK_BASE):
+        assert join_upstream_path(base, "/") == "/admin/admin_api/telegram/webhook/"
+        assert join_upstream_path(base, "/extra?x=1") == "/admin/admin_api/telegram/webhook/extra?x=1"
+        assert "//" not in join_upstream_path(base, "/extra?x=1").split("?", 1)[0]
+        prefix = upstream_rewrite_prefix(base)
+        assert prefix == WEBHOOK_BASE
+        assert prefix + "/" == join_upstream_path(base, "/")
+        assert prefix + "/extra?x=1" == join_upstream_path(base, "/extra?x=1")
+    assert join_upstream_path("", "/extra?x=1") == "/extra?x=1"
+    assert join_upstream_path("/", "/") == "/"
+    assert join_upstream_path("/", "/extra?x=1") == "/extra?x=1"
+
+
+def test_caddyfile_rewrites_base_path_and_leaves_origin_alone():
+    for path in (WEBHOOK_BASE + "/", WEBHOOK_BASE):
+        config = AppConfig(
+            wildcard_domain="hooks.example.com",
+            routes=[Route(subdomain="tgadminbot", upstream=f"https://api.stage.dddevspace.ru{path}")],
+        )
+        text, _warnings = render_caddyfile(config)
+        assert "rewrite * /admin/admin_api/telegram/webhook{http.request.uri}" in text
+        proxy = next(line.strip() for line in text.splitlines() if line.strip().startswith("reverse_proxy"))
+        assert proxy == "reverse_proxy https://api.stage.dddevspace.ru:443 {"
+        assert "/admin" not in proxy
+        assert "header_up Host {upstream_hostport}" in text
+        assert "X-Forwarded-For" in text
+        assert "X-Forwarded-Proto" in text
+        assert "X-Forwarded-Host" in text
+        assert "X-Real-IP" in text
+    plain = AppConfig(
+        wildcard_domain="hooks.example.com",
+        routes=[Route(subdomain="pay", upstream="https://1.1.1.1")],
+    )
+    text, _warnings = render_caddyfile(plain)
+    assert "rewrite" not in text
+    assert "reverse_proxy https://1.1.1.1:443 {" in text
+
+
+def test_base_path_route_is_stored(stack, capsys):
+    _wizard()
+    assert main(["routes", "add", "--subdomain", "tgadminbot", "--upstream", WEBHOOK_UPSTREAM, "--skip-probes"]) == 0
+    route = stack.store.load().route("tgadminbot")
+    assert route is not None
+    assert route.upstream == WEBHOOK_UPSTREAM
+    text = stack.layout.caddyfile.read_text(encoding="utf-8")
+    assert "rewrite * /admin/admin_api/telegram/webhook{http.request.uri}" in text
+    assert "reverse_proxy https://api.stage.dddevspace.ru/admin" not in text
+    captured = capsys.readouterr()
+    assert "https://tgadminbot.hooks.example.com" in captured.out
+    assert WEBHOOK_UPSTREAM in captured.out
+    assert "setWebhook" in captured.out
+    assert "только хост" in captured.out
+
+
+def test_menu_rejects_schemeless_upstream_before_confirm(stack, monkeypatch):
+    from proxycli.ui.menu import _routes
+
+    _wizard()
+    choices = iter(["add", "back"])
+    texts = iter(["pay", "api.stage.dddevspace.ru/admin/admin_api/telegram/webhook/"])
+    monkeypatch.setattr("proxycli.ui.menu.choose", lambda *_args, **_kwargs: next(choices))
+    monkeypatch.setattr("proxycli.ui.menu.ask_text", lambda *_args, **_kwargs: next(texts))
+
+    def _forbid(*_args, **_kwargs):
+        raise AssertionError("вопрос задан до проверки URL")
+
+    monkeypatch.setattr("proxycli.ui.menu.ask_confirm", _forbid)
+    with pytest.raises(ValidationError, match="upstream должен начинаться с http:// или https://"):
+        _routes(stack)
+    assert stack.store.load().route("pay") is None
+
+
+def test_public_host_does_not_ask_private_confirm(stack, monkeypatch, capsys):
+    from proxycli.ui.menu import _routes
+
+    _wizard()
+    choices = iter(["add", "back"])
+    texts = iter(["tgadminbot", WEBHOOK_UPSTREAM])
+    monkeypatch.setattr("proxycli.ui.menu.choose", lambda *_args, **_kwargs: next(choices))
+    monkeypatch.setattr("proxycli.ui.menu.ask_text", lambda *_args, **_kwargs: next(texts))
+
+    def _forbid(*_args, **_kwargs):
+        raise AssertionError("вопрос trusted-private задан публичному хосту")
+
+    monkeypatch.setattr("proxycli.ui.menu.ask_confirm", _forbid)
+    _routes(stack)
+    captured = capsys.readouterr()
+    assert "trusted-private" not in captured.out
+    assert "https://tgadminbot.hooks.example.com" in captured.out
+    assert WEBHOOK_UPSTREAM in captured.out
+    assert "setWebhook" in captured.out
+    assert stack.store.load().route("tgadminbot") is not None
+
+
+def test_private_host_still_asks_for_trust(stack, monkeypatch):
+    from proxycli.ui.menu import _routes
+
+    _wizard()
+    choices = iter(["add", "back"])
+    texts = iter(["pay", "http://10.1.2.3:8080/hook/"])
+    asked: list[str] = []
+    monkeypatch.setattr("proxycli.ui.menu.choose", lambda *_args, **_kwargs: next(choices))
+    monkeypatch.setattr("proxycli.ui.menu.ask_text", lambda *_args, **_kwargs: next(texts))
+    monkeypatch.setattr(
+        "proxycli.ui.menu.ask_confirm",
+        lambda label, **_kwargs: asked.append(label) or True,
+    )
+    _routes(stack)
+    assert asked == ["Подтвердить приватный апстрим (trusted-private)?"]
+    route = stack.store.load().route("pay")
+    assert route is not None
+    assert route.trust_private is True
+    assert route.upstream == "http://10.1.2.3:8080/hook/"
+
+
+def test_menu_refuses_metadata_without_confirm(stack, monkeypatch):
+    from proxycli.ui.menu import _routes
+
+    _wizard()
+    choices = iter(["add", "back"])
+    texts = iter(["pay", "http://169.254.169.254/latest"])
+    monkeypatch.setattr("proxycli.ui.menu.choose", lambda *_args, **_kwargs: next(choices))
+    monkeypatch.setattr("proxycli.ui.menu.ask_text", lambda *_args, **_kwargs: next(texts))
+
+    def _forbid(*_args, **_kwargs):
+        raise AssertionError("вопрос задан для metadata")
+
+    monkeypatch.setattr("proxycli.ui.menu.ask_confirm", _forbid)
+    with pytest.raises(ValidationError, match="metadata"):
+        _routes(stack)
+    assert stack.store.load().route("pay") is None
+
+
+def test_forbidden_upstream_ignores_trust(stack):
+    _wizard()
+    for upstream in (
+        "http://127.0.0.1:8080/hook",
+        "http://169.254.169.254/latest",
+        "http://[::1]/hook",
+        "https://metadata.google.internal/path",
+        "http://169.254.1.1:8080/hook",
+    ):
+        assert main([
+            "routes", "add", "--subdomain", "pay", "--upstream", upstream,
+            "--trust-private", "--skip-probes",
+        ]) == 2
+        assert stack.store.load().route("pay") is None
+
+
+def _timeout_report() -> ProbeReport:
+    report = ProbeReport()
+    report.layers.append(
+        LayerResult("tls", "fail", "The handshake operation timed out", "openssl s_client")
+    )
+    return report
+
+
+def _alive_report(status: int) -> ProbeReport:
+    report = ProbeReport()
+    report.layers.append(LayerResult("http", "ok", f"HTTP {status} (ответ есть, маршрут не считается мёртвым)"))
+    return report
+
+
+def test_upstream_auth_and_not_found_are_alive(monkeypatch):
+    monkeypatch.setattr("proxycli.services.probes.resolve_ipv4", lambda *_a, **_k: ["93.184.216.34"])
+    monkeypatch.setattr("proxycli.services.probes.tcp_open", lambda *_a, **_k: None)
+    monkeypatch.setattr("proxycli.services.probes.tls_probe", lambda *_a, **_k: None)
+    for status in (401, 403, 404):
+        monkeypatch.setattr(
+            "proxycli.services.probes.http_status",
+            lambda *_a, status=status, **_k: status,
+        )
+        report = probe_upstream(WEBHOOK_UPSTREAM, 1, trust_private=False)
+        assert report.ok, status
+
+
+def test_tls_handshake_timeout_is_a_failed_probe(monkeypatch):
+    monkeypatch.setattr("proxycli.services.probes.resolve_ipv4", lambda *_a, **_k: ["93.184.216.34"])
+    monkeypatch.setattr("proxycli.services.probes.tcp_open", lambda *_a, **_k: None)
+
+    def _timeout(*_args, **_kwargs):
+        raise ProbeError("The handshake operation timed out", layer="tls", fix="openssl s_client")
+
+    monkeypatch.setattr("proxycli.services.probes.tls_probe", _timeout)
+    report = probe_upstream(WEBHOOK_UPSTREAM, 1, trust_private=False)
+    assert not report.ok
+    failed = report.failed()
+    assert failed is not None
+    assert failed.layer == "tls"
+    assert "handshake" in report.summary()
+
+
+def test_probe_failure_is_saved_only_with_inactive(layout, monkeypatch):
+    runner = _RecordingRunner()
+    stack = _online_stack(layout, monkeypatch, runner)
+    stack.save_wizard(
+        public_ip="8.8.8.8",
+        domain="hooks.example.com",
+        tls_mode="http",
+        acme_email="admin@example.com",
+        probe=False,
+    )
+    monkeypatch.setattr("proxycli.managers.stack.probe_upstream", lambda *_a, **_k: _timeout_report())
+
+    def _public_must_not_roll_back(*_args, **_kwargs):
+        raise AssertionError("публичная проверка откатывает неактивный маршрут")
+
+    monkeypatch.setattr("proxycli.managers.stack.probe_public_https", _public_must_not_roll_back)
+    with pytest.raises(ProbeError, match="handshake"):
+        stack.add_route("tgadminbot", WEBHOOK_UPSTREAM, trust_private=False, probe=True)
+    assert stack.store.load().route("tgadminbot") is None
+    warnings = stack.add_route(
+        "tgadminbot",
+        WEBHOOK_UPSTREAM,
+        trust_private=False,
+        probe=True,
+        inactive=True,
+    )
+    route = stack.store.load().route("tgadminbot")
+    assert route is not None
+    assert route.upstream == WEBHOOK_UPSTREAM
+    assert route.enabled is True
+    text = stack.layout.caddyfile.read_text(encoding="utf-8")
+    assert "tgadminbot.hooks.example.com" in text
+    assert "rewrite * /admin/admin_api/telegram/webhook{http.request.uri}" in text
+    assert any("Успех доставки не подтверждён" in item for item in warnings)
+
+
+def test_http_401_saves_without_inactive(layout, monkeypatch):
+    runner = _RecordingRunner()
+    stack = _online_stack(layout, monkeypatch, runner)
+    stack.save_wizard(
+        public_ip="8.8.8.8",
+        domain="hooks.example.com",
+        tls_mode="http",
+        acme_email="admin@example.com",
+        probe=False,
+    )
+    monkeypatch.setattr("proxycli.managers.stack.probe_upstream", lambda *_a, **_k: _alive_report(401))
+    ok = ProbeReport()
+    ok.layers.extend(
+        [
+            LayerResult("dns", "ok", "8.8.8.8"),
+            LayerResult("tcp", "ok", "8.8.8.8:443"),
+            LayerResult("tls", "ok", "сертификат принят"),
+            LayerResult("http", "ok", "HTTP 401 (ответ есть, маршрут не считается мёртвым)"),
+        ]
+    )
+    monkeypatch.setattr("proxycli.managers.stack.probe_public_https", lambda *_a, **_k: ok)
+    warnings = stack.add_route("pay", "https://example.com/hook/", trust_private=False, probe=True)
+    assert not any("не подтверждён" in item for item in warnings)
+    route = stack.store.load().route("pay")
+    assert route is not None
+    assert route.enabled is True
+
+
+def test_menu_timeout_yes_saves_and_no_does_not_say_error(layout, monkeypatch, capsys):
+    from proxycli.ui.menu import _routes
+
+    runner = _RecordingRunner()
+    stack = _online_stack(layout, monkeypatch, runner)
+    stack.save_wizard(
+        public_ip="8.8.8.8",
+        domain="hooks.example.com",
+        tls_mode="http",
+        acme_email="admin@example.com",
+        probe=False,
+    )
+    monkeypatch.setattr("proxycli.managers.stack.probe_upstream", lambda *_a, **_k: _timeout_report())
+    choices = iter(["add", "back"])
+    texts = iter(["tgadminbot", WEBHOOK_UPSTREAM])
+    monkeypatch.setattr("proxycli.ui.menu.choose", lambda *_args, **_kwargs: next(choices))
+    monkeypatch.setattr("proxycli.ui.menu.ask_text", lambda *_args, **_kwargs: next(texts))
+    monkeypatch.setattr("proxycli.ui.menu.ask_confirm", lambda *_args, **_kwargs: False)
+    _routes(stack)
+    declined = capsys.readouterr().out
+    assert "Маршрут не сохранён." in declined
+    assert "Ошибка:" not in declined
+    assert "Предупреждение:" in declined
+    assert stack.store.load().route("tgadminbot") is None
+
+    choices = iter(["add", "back"])
+    texts = iter(["tgadminbot", WEBHOOK_UPSTREAM])
+    monkeypatch.setattr("proxycli.ui.menu.choose", lambda *_args, **_kwargs: next(choices))
+    monkeypatch.setattr("proxycli.ui.menu.ask_text", lambda *_args, **_kwargs: next(texts))
+    monkeypatch.setattr("proxycli.ui.menu.ask_confirm", lambda *_args, **_kwargs: True)
+    _routes(stack)
+    accepted = capsys.readouterr().out
+    assert "Ошибка:" not in accepted
+    assert "https://tgadminbot.hooks.example.com" in accepted
+    assert WEBHOOK_UPSTREAM in accepted
+    assert "setWebhook" in accepted
+    assert stack.store.load().route("tgadminbot") is not None
+    text = stack.layout.caddyfile.read_text(encoding="utf-8")
+    assert "rewrite * /admin/admin_api/telegram/webhook{http.request.uri}" in text
+
+
+def test_cli_inactive_flag_keeps_route(layout, monkeypatch, capsys):
+    runner = _RecordingRunner()
+    stack = _online_stack(layout, monkeypatch, runner)
+    stack.save_wizard(
+        public_ip="8.8.8.8",
+        domain="hooks.example.com",
+        tls_mode="http",
+        acme_email="admin@example.com",
+        probe=False,
+    )
+    monkeypatch.setattr("proxycli.managers.stack.probe_upstream", lambda *_a, **_k: _timeout_report())
+    monkeypatch.setattr("proxycli.cli.Stack", lambda: stack)
+    assert main(["routes", "add", "--subdomain", "tgadminbot", "--upstream", WEBHOOK_UPSTREAM]) == 1
+    assert stack.store.load().route("tgadminbot") is None
+    error = capsys.readouterr().err
+    assert "Ошибка:" in error
+    assert main([
+        "routes", "add", "--subdomain", "tgadminbot", "--upstream", WEBHOOK_UPSTREAM, "--inactive",
+    ]) == 0
+    assert stack.store.load().route("tgadminbot") is not None
+    saved = capsys.readouterr().out
+    assert WEBHOOK_UPSTREAM in saved
+    assert "https://tgadminbot.hooks.example.com" in saved
 
 
 def test_private_upstream_needs_trust(stack):

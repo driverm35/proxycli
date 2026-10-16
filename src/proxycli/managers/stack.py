@@ -33,6 +33,7 @@ from proxycli.utils.paths import PathLayout
 from proxycli.utils.proc import OfflineRunner, ProcResult, Runner, make_runner, require_ok
 from proxycli.utils.validation import (
     secret_ref,
+    upstream_is_forbidden,
     upstream_is_private_literal,
     validate_allowlist,
     validate_domain,
@@ -205,13 +206,26 @@ class Stack:
             return True, "модуль dns.providers.cloudflare подтверждён командой list-modules"
         return False, "list-modules не подтвердил dns.providers.cloudflare; wildcard TLS не заявляется"
 
-    def add_route(self, subdomain: str, upstream: str, *, trust_private: bool, probe: bool) -> list[str]:
+    def add_route(
+        self,
+        subdomain: str,
+        upstream: str,
+        *,
+        trust_private: bool,
+        probe: bool,
+        inactive: bool = False,
+    ) -> list[str]:
         sub = validate_subdomain(subdomain)
         origin = validate_upstream(upstream)
         config = self._require_ready()
         if config.route(sub):
             raise ValidationError(f"маршрут {sub} уже есть")
-        warnings = [self._guard_upstream(origin, trust_private=trust_private, probe=probe)]
+        warning, confirmed = self._guard_upstream(
+            origin,
+            trust_private=trust_private,
+            probe=probe,
+            inactive=inactive,
+        )
         host = config.hostname(sub)
 
         def mutate() -> None:
@@ -227,17 +241,38 @@ class Stack:
             )
             self.store.save(current)
 
-        warnings.extend(self.transaction("route-add", mutate, probe_hosts=[host], probe=probe))
+        warnings = [warning]
+        warnings.extend(
+            self.transaction(
+                "route-add",
+                mutate,
+                probe_hosts=[host] if confirmed else None,
+                probe=probe and confirmed,
+            )
+        )
         self.events.write("route.add", subdomain=sub, upstream=origin, trust_private=trust_private)
         return [item for item in warnings if item]
 
-    def edit_route(self, subdomain: str, upstream: str, *, trust_private: bool, probe: bool) -> list[str]:
+    def edit_route(
+        self,
+        subdomain: str,
+        upstream: str,
+        *,
+        trust_private: bool,
+        probe: bool,
+        inactive: bool = False,
+    ) -> list[str]:
         sub = validate_subdomain(subdomain)
         origin = validate_upstream(upstream)
         config = self._require_ready()
         if config.route(sub) is None:
             raise ValidationError(f"маршрут {sub} не найден")
-        warnings = [self._guard_upstream(origin, trust_private=trust_private, probe=probe)]
+        warning, confirmed = self._guard_upstream(
+            origin,
+            trust_private=trust_private,
+            probe=probe,
+            inactive=inactive,
+        )
         host = config.hostname(sub)
 
         def mutate() -> None:
@@ -247,9 +282,18 @@ class Stack:
                 raise ValidationError(f"маршрут {sub} не найден")
             route.upstream = origin
             route.trust_private = trust_private
+            route.enabled = True
             self.store.save(current)
 
-        warnings.extend(self.transaction("route-edit", mutate, probe_hosts=[host], probe=probe))
+        warnings = [warning]
+        warnings.extend(
+            self.transaction(
+                "route-edit",
+                mutate,
+                probe_hosts=[host] if confirmed else None,
+                probe=probe and confirmed,
+            )
+        )
         self.events.write("route.edit", subdomain=sub, upstream=origin)
         return [item for item in warnings if item]
 
@@ -343,23 +387,55 @@ class Stack:
             raise ProxyCLIError("мастер ещё не завершён", fix="proxycli wizard --help")
         return config
 
-    def _guard_upstream(self, origin: str, *, trust_private: bool, probe: bool) -> str:
+    def _guard_upstream(
+        self,
+        origin: str,
+        *,
+        trust_private: bool,
+        probe: bool,
+        inactive: bool = False,
+    ) -> tuple[str, bool]:
+        """Return a warning and whether the upstream probe succeeded.
+
+        The second value is False when the route is being saved without a
+        successful reachability check. The caller must still keep that route:
+        a failed DNS, TCP, or TLS probe is not a reason to roll it back.
+        """
+        if upstream_is_forbidden(origin):
+            raise ValidationError(
+                "апстрим на loopback, link-local или metadata запрещён",
+                fix="эти адреса нельзя использовать даже с --trust-private",
+            )
         if upstream_is_private_literal(origin) and not trust_private:
             raise ValidationError(
                 "частный или служебный upstream запрещён без явного подтверждения",
                 fix="повторите с --trust-private, если это ваш сервер",
             )
         if not probe or self.offline() or self._skip_probes():
-            return "проверка upstream пропущена, успех не заявляется"
+            if inactive:
+                return (
+                    "Маршрут сохранён без успешной проверки upstream. "
+                    "Caddy будет пересылать запросы. Успех доставки не подтверждён.",
+                    False,
+                )
+            return ("проверка upstream пропущена, успех не заявляется", True)
         report = probe_upstream(origin, timeout=5, trust_private=trust_private)
-        if not report.ok:
-            failed = report.failed()
+        if report.ok:
+            return ("", True)
+        failed = report.failed()
+        if failed is not None and failed.layer == "policy":
+            raise ProbeError(report.summary(), layer="policy", fix=failed.fix)
+        if not inactive:
             raise ProbeError(
                 report.summary(),
                 layer=failed.layer if failed else "upstream",
-                fix=failed.fix if failed else "",
+                fix=failed.fix if failed else "повторите с --inactive, чтобы сохранить маршрут неактивным",
             )
-        return ""
+        return (
+            f"Предупреждение: {report.summary()}. Маршрут сохранён. "
+            "Caddy будет пересылать запросы. Успех доставки не подтверждён.",
+            False,
+        )
 
     def _rollback(self, snap: str, original: Exception, *, reason: str = "") -> None:
         try:

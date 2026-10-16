@@ -41,6 +41,18 @@ def socks_example(host: str, port: int, username: str) -> str:
     return f"socks5://{username}:****@{host}:{port}"
 
 
+def route_added_text(public_host: str, upstream: str) -> str:
+    public = f"https://{public_host}"
+    return "\n".join(
+        [
+            f"{public} принимает запрос и отправляет его на {upstream}.",
+            f"Укажите в Telegram (Bot API setWebhook) адрес {public}",
+            "Если в публичном адресе будет путь, он добавится к базовому пути апстрима. "
+            "Для Telegram укажите только хост, без пути.",
+        ]
+    )
+
+
 def copy_secret(secret: str) -> bool:
     if not sys.stdout.isatty() or plain_terminal():
         return False

@@ -81,3 +81,40 @@ def is_blocked_host(host: str) -> bool:
         inner = name[1:].split("]", 1)[0]
         return is_blocked_ip(inner)
     return is_blocked_ip(name)
+
+
+def _host_name(host: str) -> str:
+    return host.strip().lower().rstrip(".")
+
+
+def _host_address(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(_host_name(host))
+    except ValueError:
+        return None
+
+
+def is_loopback_host(host: str) -> bool:
+    name = _host_name(host)
+    if name in {"localhost", "localhost.localdomain"} or name.endswith(".localhost"):
+        return True
+    address = _host_address(name)
+    return address is not None and address.is_loopback
+
+
+def is_link_local_host(host: str) -> bool:
+    address = _host_address(host)
+    return address is not None and address.is_link_local
+
+
+def is_metadata_host(host: str) -> bool:
+    name = _host_name(host)
+    if name in {"metadata", "metadata.google.internal", "metadata.google.com", "instance-data"}:
+        return True
+    address = _host_address(name)
+    return address is not None and str(address) in METADATA_IPS
+
+
+def is_forbidden_upstream_host(host: str) -> bool:
+    """Loopback, link-local, and cloud metadata are never a webhook upstream."""
+    return is_loopback_host(host) or is_link_local_host(host) or is_metadata_host(host)

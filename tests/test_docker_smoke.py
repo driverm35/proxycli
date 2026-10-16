@@ -6,7 +6,8 @@ from pathlib import Path
 import pytest
 
 from proxycli.constants import CADDY_IMAGE, THREEPROXY_IMAGE
-from proxycli.models.config import AppConfig, Listener, ProxyUser
+from proxycli.models.config import AppConfig, Listener, ProxyUser, Route
+from proxycli.services.caddyfile import render_caddyfile
 from proxycli.services.probes import http_proxy_status, socks5_connect, socks5_noauth_rejected
 from proxycli.services.proxy3cfg import render_3proxy
 
@@ -119,6 +120,39 @@ def test_caddy_reload_address_is_ipv4_admin(tmp_path: Path):
         assert "[::1]:2019" in ipv6_text
     finally:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+
+
+@pytest.mark.skipif(not _docker_ok(), reason="Docker недоступен: caddy validate базового пути пропущен")
+def test_caddy_validate_base_path_route(tmp_path: Path):
+    config = AppConfig(
+        wildcard_domain="hooks.example.com",
+        routes=[
+            Route(
+                subdomain="tgadminbot",
+                upstream="https://api.stage.dddevspace.ru/admin/admin_api/telegram/webhook/",
+            )
+        ],
+    )
+    config.tls.acme_email = "admin@example.com"
+    text, _warnings = render_caddyfile(config)
+    assert "rewrite * /admin/admin_api/telegram/webhook{http.request.uri}" in text
+    caddyfile = tmp_path / "Caddyfile"
+    caddyfile.write_text(text, encoding="utf-8", newline="\n")
+    mounted = f"{caddyfile.resolve().as_posix()}:/etc/caddy/Caddyfile:ro"
+    validate = subprocess.run(
+        [
+            "docker", "run", "--rm", "--network", "none",
+            "-v", mounted,
+            CADDY_IMAGE,
+            "caddy", "validate",
+            "--config", "/etc/caddy/Caddyfile",
+            "--adapter", "caddyfile",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert validate.returncode == 0, validate.stderr or validate.stdout
 
 
 def _reload_argv(name: str, extra: list[str]) -> list[str]:

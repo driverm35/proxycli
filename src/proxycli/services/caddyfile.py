@@ -3,7 +3,9 @@ from __future__ import annotations
 from proxycli.constants import CADDY_ADMIN
 from proxycli.models.config import AppConfig, Route
 from proxycli.utils.validation import (
+    upstream_base_path,
     upstream_host_port,
+    upstream_rewrite_prefix,
     validate_domain,
     validate_subdomain,
     validate_upstream,
@@ -80,16 +82,25 @@ def _proxy_lines(route: Route, indent: str) -> list[str]:
         target = f"{scheme}://[{host}]:{port}"
     else:
         target = f"{scheme}://{host}:{port}"
+    # The prefix has no trailing slash. {http.request.uri} is the incoming
+    # path plus query and always starts with /, so the join has one slash.
+    prefix = upstream_rewrite_prefix(upstream_base_path(origin))
     inner = indent + "\t"
-    return [
-        f"{indent}reverse_proxy {target} {{",
-        f"{inner}header_up Host {{upstream_hostport}}",
-        f"{inner}header_up X-Real-IP {{remote_host}}",
-        f"{inner}header_up X-Forwarded-For {{remote_host}}",
-        f"{inner}header_up X-Forwarded-Proto {{scheme}}",
-        f"{inner}header_up X-Forwarded-Host {{host}}",
-        f"{indent}}}",
-    ]
+    lines: list[str] = []
+    if prefix is not None:
+        lines.append(f"{indent}rewrite * {prefix}{{http.request.uri}}")
+    lines.extend(
+        [
+            f"{indent}reverse_proxy {target} {{",
+            f"{inner}header_up Host {{upstream_hostport}}",
+            f"{inner}header_up X-Real-IP {{remote_host}}",
+            f"{inner}header_up X-Forwarded-For {{remote_host}}",
+            f"{inner}header_up X-Forwarded-Proto {{scheme}}",
+            f"{inner}header_up X-Forwarded-Host {{host}}",
+            f"{indent}}}",
+        ]
+    )
+    return lines
 
 
 def _matcher(subdomain: str) -> str:
@@ -128,3 +139,18 @@ def assert_caddyfile_contains_routes(text: str, config: AppConfig) -> None:
             raise ValueError("в Caddyfile нет заголовков X-Forwarded-*")
         if "tls_insecure_skip_verify" in text:
             raise ValueError("пропуск проверки TLS запрещён")
+        origin = validate_upstream(route.upstream)
+        upstream_host, upstream_port, scheme = upstream_host_port(origin)
+        if ":" in upstream_host:
+            target = f"{scheme}://[{upstream_host}]:{upstream_port}"
+        else:
+            target = f"{scheme}://{upstream_host}:{upstream_port}"
+        if f"reverse_proxy {target}" not in text:
+            raise ValueError(f"в Caddyfile нет reverse_proxy на {target}")
+        prefix = upstream_rewrite_prefix(upstream_base_path(origin))
+        if prefix is not None and f"rewrite * {prefix}{{http.request.uri}}" not in text:
+            raise ValueError("в Caddyfile нет rewrite базового пути")
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("reverse_proxy") and prefix and prefix in stripped:
+                raise ValueError("reverse_proxy не должен содержать базовый путь")

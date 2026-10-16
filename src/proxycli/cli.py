@@ -18,7 +18,7 @@ from proxycli.services.probes import (
     socks5_noauth_rejected,
 )
 from proxycli.services.store import password_from_file
-from proxycli.ui.console import CLEARTEXT_WARNING, curl_example, socks_example
+from proxycli.ui.console import CLEARTEXT_WARNING, curl_example, route_added_text, socks_example
 from proxycli.ui.status import plain_status
 from proxycli.utils.validation import validate_password
 
@@ -130,6 +130,7 @@ def _route_flags(parser: argparse.ArgumentParser, func) -> None:
     parser.add_argument("--subdomain", required=True)
     parser.add_argument("--upstream", required=True)
     parser.add_argument("--trust-private", action="store_true")
+    parser.add_argument("--inactive", action="store_true")
     parser.add_argument("--skip-probes", action="store_true")
     parser.set_defaults(func=func)
 
@@ -252,25 +253,31 @@ def cmd_routes_list(_args: argparse.Namespace) -> int:
 
 
 def cmd_routes_add(args: argparse.Namespace) -> int:
-    warnings = Stack().add_route(
+    stack = Stack()
+    warnings = stack.add_route(
         args.subdomain,
         args.upstream,
         trust_private=args.trust_private,
         probe=not args.skip_probes,
+        inactive=args.inactive,
     )
     _warnings(warnings)
-    print("Маршрут записан. Публичный TLS успешен только если проверка не была пропущена и прошла.")
+    _print_route(stack, args.subdomain)
+    print("Публичный TLS успешен только если проверка не была пропущена и прошла.")
     return 0
 
 
 def cmd_routes_edit(args: argparse.Namespace) -> int:
-    warnings = Stack().edit_route(
+    stack = Stack()
+    warnings = stack.edit_route(
         args.subdomain,
         args.upstream,
         trust_private=args.trust_private,
         probe=not args.skip_probes,
+        inactive=args.inactive,
     )
     _warnings(warnings)
+    _print_route(stack, args.subdomain)
     return 0
 
 
@@ -485,6 +492,16 @@ def _read_password(args: argparse.Namespace) -> str | None:
         print("Предупреждение: пароль в аргументах виден в списке процессов", file=sys.stderr)
         return validate_password(args.password)
     return None
+
+
+def _print_route(stack: Stack, subdomain: str) -> None:
+    from proxycli.utils.validation import validate_subdomain
+
+    config = stack.store.load()
+    route = config.route(validate_subdomain(subdomain))
+    if route is None:
+        return
+    print(route_added_text(config.hostname(route.subdomain), route.upstream))
 
 
 def _warnings(warnings: list[str]) -> None:
