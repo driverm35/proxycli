@@ -81,4 +81,5 @@ def require_ok(result: ProcResult, argv: list[str]) -> ProcResult:
     if result.ok:
         return result
     detail = (result.stderr or result.stdout or "ненулевой код").strip()
-    raise ProxyCLIError(f"команда завершилась с ошибкой ({argv[0]}): {detail}")
+    command = " ".join(argv)
+    raise ProxyCLIError(f"команда завершилась с ошибкой ({command}): {detail}")

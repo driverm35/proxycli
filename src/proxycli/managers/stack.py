@@ -130,7 +130,11 @@ class Stack:
         else:
             dns_ok, detail = check_name_dns(zone, ip, timeout=5)
             if not dns_ok and not accept_dns:
-                raise ProbeError(detail, layer="dns", fix="создайте A-запись или передайте --accept-dns")
+                raise ProbeError(
+                    f"Домен не сохранён: проверка DNS не совпала. {detail} Caddy не запускался.",
+                    layer="dns",
+                    fix="создайте A-запись на публичный IPv4 этого сервера и запустите мастер снова",
+                )
             if not dns_ok:
                 warnings.append(detail)
         ready = False
@@ -182,7 +186,10 @@ class Stack:
         built = self.runner(build, timeout=600)
         if not built.ok:
             return False, "сборка образа Caddy с модулем Cloudflare не удалась; wildcard TLS не выпущен"
-        listed = self.runner(["docker", "run", "--rm", CADDY_DNS_IMAGE, "list-modules"], timeout=90)
+        listed = self.runner(
+            ["docker", "run", "--rm", CADDY_DNS_IMAGE, "caddy", "list-modules"],
+            timeout=90,
+        )
         if listed.ok and CADDY_DNS_MODULE in listed.stdout:
             return True, "модуль dns.providers.cloudflare подтверждён командой list-modules"
         return False, "list-modules не подтвердил dns.providers.cloudflare; wildcard TLS не заявляется"
@@ -346,12 +353,18 @@ class Stack:
     def _rollback(self, snap: str, original: Exception) -> None:
         try:
             self.backup.restore(snap)
-            self.reload(probe=False, simulate_failure=False)
         except Exception as exc:
             raise RollbackError(
-                f"откат не удался: {exc}",
+                f"{original}. Откат файлов не удался: {exc}",
                 fix=f"proxycli backup restore --id {snap}",
             ) from original
+        if isinstance(original, ProxyCLIError) and snap not in original.message:
+            original.message = (
+                f"{original.message} Файлы возвращены из копии {snap}; "
+                "повторное восстановление не обязательно."
+            )
+            if original.fix.startswith("proxycli backup restore"):
+                original.fix = ""
 
     def _write_runtime(self, caddy: str, proxy: str, compose: str) -> None:
         self.layout.ensure_dirs()
@@ -372,6 +385,7 @@ class Stack:
             "-v",
             f"{caddyfile}:/etc/caddy/Caddyfile:ro",
             image,
+            "caddy",
             "validate",
             "--config",
             "/etc/caddy/Caddyfile",

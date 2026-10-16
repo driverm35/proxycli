@@ -8,15 +8,16 @@ import pytest
 
 from proxycli.cli import main
 from proxycli.constants import CADDY_IMAGE, DOCKER_CE_VERSION, THREEPROXY_IMAGE
-from proxycli.errors import ValidationError
+from proxycli.errors import ProbeError, ProxyCLIError, RollbackError, ValidationError
 from proxycli.managers.firewall import command_is_unsafe, plan_apply, plan_rollback
+from proxycli.managers.stack import Stack
 from proxycli.models.config import AppConfig, Listener, ProxyUser, Route
 from proxycli.services.caddyfile import render_caddyfile
 from proxycli.services.compose import ENTRYPOINT, render_compose, render_dockerfile
 from proxycli.services.proxy3cfg import render_3proxy
 from proxycli.ui.console import CLEARTEXT_WARNING, curl_example
 from proxycli.ui.status import plain_status, unicode_disabled
-from proxycli.utils.proc import SubprocessRunner
+from proxycli.utils.proc import ProcResult, SubprocessRunner
 from proxycli.utils.validation import validate_domain, validate_subdomain, validate_upstream
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -290,6 +291,131 @@ def test_socks_and_http_clients():
     assert http_proxy_status("127.0.0.1", http_port, "1.1.1.1", 443, 2) == 407
     thread.join(2)
     httpd.close()
+
+
+class _RecordingRunner:
+    def __init__(self, fail_token: str = "") -> None:
+        self.calls: list[list[str]] = []
+        self.fail_token = fail_token
+
+    def __call__(self, argv: list[str], timeout: float = 30) -> ProcResult:
+        self.calls.append(list(argv))
+        if self.fail_token and self.fail_token in argv:
+            return ProcResult(1, "", 'exec: "validate": executable file not found in $PATH')
+        return ProcResult(0, "", "")
+
+
+def _online_stack(layout, monkeypatch, runner):
+    monkeypatch.delenv("PROXYCLI_OFFLINE", raising=False)
+    return Stack(layout, runner)
+
+
+def test_caddy_validate_argv_invokes_caddy(layout, monkeypatch):
+    runner = _RecordingRunner()
+    stack = _online_stack(layout, monkeypatch, runner)
+    stack.save_wizard(
+        public_ip="8.8.8.8",
+        domain="hooks.example.com",
+        tls_mode="http",
+        acme_email="admin@example.com",
+        probe=False,
+    )
+    validate = next(call for call in runner.calls if "validate" in call)
+    image_at = validate.index(CADDY_IMAGE)
+    assert validate[image_at + 1 : image_at + 3] == ["caddy", "validate"]
+    assert "--entrypoint" not in validate
+    reload = next(call for call in runner.calls if "reload" in call)
+    assert reload[reload.index("reload") - 1] == "caddy"
+    modules = [call for call in runner.calls if "list-modules" in call]
+    assert modules == []
+
+
+def test_validate_failure_reports_command_not_rollback(layout, monkeypatch):
+    runner = _RecordingRunner(fail_token="validate")
+    stack = _online_stack(layout, monkeypatch, runner)
+    with pytest.raises(ProxyCLIError) as caught:
+        stack.save_wizard(
+            public_ip="8.8.8.8",
+            domain="hooks.example.com",
+            tls_mode="http",
+            acme_email="admin@example.com",
+            probe=False,
+        )
+    error = caught.value
+    assert not isinstance(error, RollbackError)
+    text = str(error)
+    assert "откат не удался" not in text
+    assert "caddy validate" in text
+    assert "executable file not found" in text
+    assert not error.fix.startswith("proxycli backup restore")
+    assert "не обязательно" in text
+    assert stack.store.load().wildcard_domain == ""
+    assert stack.store.load().first_run_complete is False
+    assert runner.calls
+    assert all(call[call.index(CADDY_IMAGE) + 1] != "validate" for call in runner.calls if CADDY_IMAGE in call)
+
+
+def test_dns_decline_stops_before_docker(layout, monkeypatch):
+    runner = _RecordingRunner()
+    stack = _online_stack(layout, monkeypatch, runner)
+    monkeypatch.setattr(
+        "proxycli.managers.stack.check_name_dns",
+        lambda *_args, **_kwargs: (False, "имя не указывает на сервер"),
+    )
+    with pytest.raises(ProbeError) as caught:
+        stack.save_wizard(
+            public_ip="8.8.8.8",
+            domain="hooks.example.com",
+            tls_mode="http",
+            acme_email="admin@example.com",
+            accept_dns=False,
+            probe=True,
+        )
+    assert "Домен не сохранён" in str(caught.value)
+    assert "Caddy не запускался" in str(caught.value)
+    assert runner.calls == []
+    assert stack.store.load().wildcard_domain == ""
+    assert stack.store.load().first_run_complete is False
+
+
+def test_dns_mismatch_continues_only_when_accepted(layout, monkeypatch):
+    runner = _RecordingRunner()
+    stack = _online_stack(layout, monkeypatch, runner)
+    monkeypatch.setattr(
+        "proxycli.managers.stack.check_name_dns",
+        lambda *_args, **_kwargs: (False, "имя не указывает на сервер"),
+    )
+    stack.save_wizard(
+        public_ip="8.8.8.8",
+        domain="hooks.example.com",
+        tls_mode="http",
+        acme_email="admin@example.com",
+        accept_dns=True,
+        probe=True,
+    )
+    assert any("validate" in call for call in runner.calls)
+    assert stack.store.load().wildcard_domain == "hooks.example.com"
+
+
+def test_wizard_ui_dns_decline_does_not_start_caddy(layout, monkeypatch, capsys):
+    from proxycli.ui.wizard import run_wizard
+
+    runner = _RecordingRunner()
+    stack = _online_stack(layout, monkeypatch, runner)
+    answers = iter(["8.8.8.8", "hooks.example.com", "admin@example.com"])
+    monkeypatch.setattr("proxycli.ui.wizard.ask_text", lambda *_args, **_kwargs: next(answers))
+    monkeypatch.setattr("proxycli.ui.wizard.choose", lambda *_args, **_kwargs: "http")
+    monkeypatch.setattr("proxycli.ui.wizard.ask_confirm", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr("proxycli.ui.wizard.detect_public_ipv4", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(
+        "proxycli.managers.stack.check_name_dns",
+        lambda *_args, **_kwargs: (False, "имя не указывает на сервер"),
+    )
+    assert run_wizard(stack) == 1
+    captured = capsys.readouterr()
+    assert "Домен не сохранён" in captured.out
+    assert runner.calls == []
+    assert stack.store.load().wildcard_domain == ""
 
 
 def test_backup_roundtrip(stack):
