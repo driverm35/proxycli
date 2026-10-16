@@ -118,3 +118,53 @@ def test_port_helper_and_dry_run():
     assert "dry-run" in dry.stdout
     assert "29.8.2" in dry.stdout
     assert shutil.which("shellcheck") or True
+
+
+def _piped(name: str, args: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess[bytes]:
+    assert BASH is not None
+    return subprocess.run(
+        [BASH, "-s", "--", *args],
+        input=(ROOT / name).read_bytes(),
+        capture_output=True,
+        env=env,
+        timeout=20,
+    )
+
+
+@pytest.mark.skipif(BASH is None, reason="bash недоступен: проверка piped install.sh пропущена")
+def test_piped_stdin_dry_run():
+    env = {**os.environ, "PROXYCLI_ASSUME_OS": "ubuntu-24.04", "PROXYCLI_ASSUME_ARCH": "x86_64"}
+    good = _piped("install.sh", ["--dry-run"], env)
+    stdout = good.stdout.decode("utf-8", "replace")
+    stderr = good.stderr.decode("utf-8", "replace")
+    assert "unbound variable" not in stdout
+    assert "unbound variable" not in stderr
+    assert good.returncode == 0, stderr
+    assert "dry-run" in stdout
+    assert "Docker CE 29.8.2" in stdout
+    assert "Caddy caddy:2.11.7" in stdout
+    assert "3proxy 3proxy/3proxy:0.9.9.1" in stdout
+
+    rejected = _piped(
+        "install.sh",
+        ["--dry-run"],
+        {**os.environ, "PROXYCLI_ASSUME_OS": "ubuntu-22.04", "PROXYCLI_ASSUME_ARCH": "x86_64"},
+    )
+    rejected_out = rejected.stdout.decode("utf-8", "replace")
+    rejected_err = rejected.stderr.decode("utf-8", "replace")
+    assert "unbound variable" not in rejected_out
+    assert "unbound variable" not in rejected_err
+    assert rejected.returncode != 0
+    assert "22.04" in rejected_err
+    assert "dry-run" not in rejected_out
+
+
+@pytest.mark.skipif(BASH is None, reason="bash недоступен: проверка piped install.sh пропущена")
+def test_piped_uninstall_help():
+    result = _piped("uninstall.sh", ["--help"])
+    stdout = result.stdout.decode("utf-8", "replace")
+    stderr = result.stderr.decode("utf-8", "replace")
+    assert "unbound variable" not in stdout
+    assert "unbound variable" not in stderr
+    assert result.returncode == 0, stderr
+    assert "--purge" in stdout

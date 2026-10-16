@@ -26,7 +26,7 @@ usage() {
 
 Без --purge сохраняет /etc/proxycli, журналы и /var/lib/proxycli.
 --purge удаляет конфигурацию, секреты, резервные копии и тома Caddy.
-Нужен --yes, если stdin не TTY.
+Нужен --yes, если нет терминала.
 Firewall: удаляются только правила с комментарием proxycli-*. Flush не выполняется.
 EOF
 }
@@ -50,20 +50,21 @@ check_root() {
 }
 
 confirm_purge() {
-  local answer
+  local answer=""
   if [[ "$PURGE" != "1" ]]; then
     return 0
   fi
   if [[ "$YES" == "1" ]]; then
     return 0
   fi
-  if [[ ! -t 0 ]]; then
-    die "purge без TTY требует --yes" "bash uninstall.sh --purge --yes"
+  # stdin is the script when piped, so the confirmation has to come from the terminal.
+  if [[ -r /dev/tty ]] && read -r -p "Удалить конфигурацию, секреты и тома? [y/N] " answer </dev/tty; then
+    if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
+      die "удаление данных отменено" "bash uninstall.sh --purge --yes"
+    fi
+    return 0
   fi
-  read -r -p "Удалить конфигурацию, секреты и тома? [y/N] " answer
-  if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
-    die "удаление данных отменено" "bash uninstall.sh --purge --yes"
-  fi
+  die "purge без TTY требует --yes" "bash uninstall.sh --purge --yes"
 }
 
 rollback_firewall() {
@@ -115,6 +116,8 @@ main() {
   log "ProxyCLI удалён"
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+# `curl | bash` leaves BASH_SOURCE unset; ${BASH_SOURCE[0]} aborts under set -u.
+# An empty source means this process is the uninstaller. A different path means it was sourced.
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]:-}" == "$0" ]]; then
   main "$@"
 fi

@@ -255,6 +255,8 @@ main() {
   launch_menu
 }
 
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+# `curl | bash` leaves BASH_SOURCE unset; ${BASH_SOURCE[0]} aborts under set -u.
+# An empty source means this process is the installer. A different path means it was sourced.
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]:-}" == "${0}" ]]; then
   main "$@"
 fi
