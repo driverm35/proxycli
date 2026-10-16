@@ -137,8 +137,8 @@ def test_3proxy_requires_auth_and_blocks_metadata():
     assert "169.254.169.254" in text
     assert "metadata.google.internal" in text
     assert "alice:CL:AlicePassword1" in text
-    assert "socks -p1080" in text
-    assert "proxy -p3128" in text
+    assert "socks -p1080 -n -u2" in text
+    assert "proxy -p3128 -n -u2" in text
     assert "allow bob 203.0.113.10" in text
     compose = render_compose(config, Path("/etc/proxycli/cloudflare.token"))
     assert "0.0.0.0:1080:1080" in compose

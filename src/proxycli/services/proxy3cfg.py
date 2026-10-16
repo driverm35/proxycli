@@ -30,12 +30,12 @@ def render_3proxy(config: AppConfig, secrets: dict[str, str]) -> str:
     ]
     if socks_on:
         lines.extend(_acl(config.socks, "socks", secrets))
-        lines.append(f"socks -p{config.socks.port} -n")
+        lines.append(f"socks -p{config.socks.port} -n -u2")
     if http_on:
         if socks_on:
             lines.append("flush")
         lines.extend(_acl(config.http, "http", secrets))
-        lines.append(f"proxy -p{config.http.port} -n")
+        lines.append(f"proxy -p{config.http.port} -n -u2")
     text = "\n".join(lines) + "\n"
     assert_proxy_safe(text, config)
     return text
@@ -55,6 +55,9 @@ def assert_proxy_safe(text: str, config: AppConfig) -> None:
             raise ValueError("SOCKS5 слушает без пользователей")
         if text.count("\nproxy ") and not _active(config.http):
             raise ValueError("HTTP-прокси слушает без пользователей")
+        for line in text.splitlines():
+            if line.startswith(("socks ", "proxy ")) and "-u2" not in line.split():
+                raise ValueError("сервис принимает анонимный метод: нужен -u2")
     if "\x00" in text or "$(" in text or "`" in text:
         raise ValueError("конфигурация 3proxy содержит запрещённую последовательность")
 
