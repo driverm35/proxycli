@@ -1,0 +1,15 @@
+[Unit]
+Description=ProxyCLI compose stack
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/var/lib/proxycli/deploy
+ExecStart=/usr/bin/docker compose -f /var/lib/proxycli/deploy/compose.yaml --project-directory /var/lib/proxycli/deploy up -d --remove-orphans
+ExecStop=/usr/bin/docker compose -f /var/lib/proxycli/deploy/compose.yaml --project-directory /var/lib/proxycli/deploy stop
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

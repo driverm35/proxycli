@@ -1,0 +1,8 @@
+{
+	admin off
+}
+
+:80 {
+	respond /health "ok" 200
+	respond "proxycli" 404
+}
