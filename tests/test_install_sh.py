@@ -159,6 +159,96 @@ def test_piped_stdin_dry_run():
     assert "dry-run" not in rejected_out
 
 
+def _sourced(script: str, body: str) -> tuple[int, str, str]:
+    assert BASH is not None
+    result = subprocess.run(
+        [BASH, "-c", f'source "{script}"\n{body}'],
+        capture_output=True,
+        timeout=20,
+    )
+    stdout = result.stdout.decode("utf-8", "replace")
+    stderr = result.stderr.decode("utf-8", "replace")
+    return result.returncode, stdout, stderr
+
+
+@pytest.mark.skipif(BASH is None, reason="bash недоступен: функциональные проверки install.sh пропущены")
+def test_docker_source_prefers_pinned_version():
+    script = _script("install.sh")
+    code, stdout, stderr = _sourced(
+        script,
+        """
+apt-cache() {
+  printf '%s\\n' 'docker-ce | 5:29.9.0-1~ubuntu.24.04~noble | https://download.docker.com/linux/ubuntu noble/stable amd64 Packages'
+  printf '%s\\n' \"docker-ce | 5:${DOCKER_CE_VERSION}-1~ubuntu.24.04~noble | https://download.docker.com/linux/ubuntu noble/stable amd64 Packages\"
+  return 0
+}
+choose_docker_source
+""",
+    )
+    assert code == 0, stderr
+    assert stdout.strip().startswith("pinned ")
+    assert "5:29.8.2-1~ubuntu.24.04~noble" in stdout
+    assert "Предупреждение" not in stderr
+
+
+@pytest.mark.skipif(BASH is None, reason="bash недоступен: функциональные проверки install.sh пропущены")
+def test_docker_source_uses_newest_when_pin_missing():
+    script = _script("install.sh")
+    code, stdout, stderr = _sourced(
+        script,
+        """
+apt-cache() {
+  printf '%s\\n' 'docker-ce | 5:29.8.20-1~ubuntu.26.04~resolute | https://download.docker.com/linux/ubuntu resolute/stable amd64 Packages'
+  printf '%s\\n' 'docker-ce | 5:28.5.1-1~ubuntu.26.04~resolute | https://download.docker.com/linux/ubuntu resolute/stable amd64 Packages'
+  return 0
+}
+choose_docker_source
+""",
+    )
+    assert code == 0, stderr
+    assert stdout.strip() == "newest 5:29.8.20-1~ubuntu.26.04~resolute"
+    assert "Предупреждение" in stderr
+    assert "29.8.2" in stderr
+    assert "29.8.20" in stderr
+    assert not stdout.strip().startswith("pinned")
+
+
+@pytest.mark.skipif(BASH is None, reason="bash недоступен: функциональные проверки install.sh пропущены")
+def test_docker_source_falls_back_to_distro_packages():
+    script = _script("install.sh")
+    code, stdout, stderr = _sourced(
+        script,
+        """
+apt-cache() {
+  return 0
+}
+choose_docker_source
+""",
+    )
+    assert code == 0, stderr
+    assert stdout.strip() == "distro"
+    assert "Предупреждение" in stderr
+    assert "docker.io" in stderr
+
+
+@pytest.mark.skipif(BASH is None, reason="bash недоступен: функциональные проверки install.sh пропущены")
+def test_err_trap_reports_failing_command():
+    script = _script("install.sh")
+    code, _stdout, stderr = _sourced(
+        script,
+        """
+proxycli_trap_fn() { false; }
+proxycli_trap_fn
+""",
+    )
+    assert code != 0
+    assert "Ошибка установки" in stderr
+    assert "Команда: false" in stderr
+    assert "Строка:" in stderr
+    assert "install.log" in stderr
+    assert "bash -x" in stderr
+
+
 @pytest.mark.skipif(BASH is None, reason="bash недоступен: проверка piped install.sh пропущена")
 def test_piped_uninstall_help():
     result = _piped("uninstall.sh", ["--help"])
