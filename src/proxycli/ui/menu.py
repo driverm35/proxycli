@@ -10,6 +10,8 @@ from proxycli.ui.console import (
     console,
     copy_secret,
     curl_example,
+    format_user_list,
+    reveal_user,
     route_added_text,
     socks_example,
 )
@@ -22,6 +24,11 @@ from proxycli.utils.validation import (
     validate_subdomain,
     validate_upstream,
 )
+
+
+def _show_until_enter(out, text: str) -> None:
+    out.print(text, markup=False, highlight=False)
+    pause()
 
 
 def run_main_menu() -> int:
@@ -161,8 +168,7 @@ def _users(stack: Stack, kind: str) -> None:
         config = stack.store.load()
         listener = config.socks if kind == "socks" else config.http
         if choice == "list":
-            for user in listener.users:
-                out.print(f"{user.username}  порт {listener.port}")
+            _show_until_enter(out, format_user_list(kind, config))
             continue
         username = ask_text("Имя пользователя")
         if not username:
@@ -170,25 +176,27 @@ def _users(stack: Stack, kind: str) -> None:
         if choice == "add":
             password, warnings = stack.add_user(kind, username, None)
             for warning in warnings:
-                out.print(warning)
+                out.print(warning, markup=False, highlight=False)
             host = config.public_ipv4 or "SERVER_IP"
             if kind == "http":
-                out.print(curl_example(host, listener.port, username))
+                out.print(curl_example(host, listener.port, username), markup=False, highlight=False)
             else:
-                out.print(socks_example(host, listener.port, username))
-            if not copy_secret(password):
-                out.print(f"Пароль (скопируйте строку): {password}")
+                out.print(socks_example(host, listener.port, username), markup=False, highlight=False)
+            out.print(f"Пароль (скопируйте строку): {password}", markup=False, highlight=False)
+            copy_secret(password)
+            pause()
             continue
         if choice == "reveal":
-            user = listener.user(username)
-            if user is None:
-                out.print("Пользователь не найден.")
-                continue
-            secret = stack.store.load_secrets().get(user.secret_ref, "")
-            stack.events.write(f"{kind}.reveal", username=username)
-            if not copy_secret(secret):
-                out.print(f"Пароль (скопируйте строку): {secret}")
+            if stack.store.layout.secrets_file.exists():
+                secrets = stack.store.load_secrets()
+            else:
+                secrets = None
+            text = reveal_user(kind, username, config, secrets)
+            out.print(text, markup=False, highlight=False)
+            if text.startswith("Пароль:"):
+                stack.events.write(f"{kind}.reveal", username=username)
+            pause()
             continue
         if choice == "delete" and ask_confirm(f"Удалить {username}?", default=False):
             stack.remove_user(kind, username)
-            out.print("Удалено.")
+            _show_until_enter(out, "Удалено.")

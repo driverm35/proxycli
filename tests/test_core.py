@@ -16,7 +16,7 @@ from proxycli.services.caddyfile import render_caddyfile
 from proxycli.services.compose import ENTRYPOINT, render_compose, render_dockerfile
 from proxycli.services.probes import LayerResult, ProbeReport, probe_upstream
 from proxycli.services.proxy3cfg import render_3proxy
-from proxycli.ui.console import CLEARTEXT_WARNING, curl_example
+from proxycli.ui.console import CLEARTEXT_WARNING, curl_example, format_user_list, reveal_user
 from proxycli.ui.status import plain_status, unicode_disabled
 from proxycli.utils.proc import ProcResult, SubprocessRunner
 from proxycli.utils.validation import (
@@ -520,6 +520,184 @@ def test_passwords_are_not_logged(stack, capsys):
     assert "AlicePassword1" in stack.layout.proxy_cfg.read_text(encoding="utf-8")
     assert main(["socks", "reveal", "--username", "alice", "--i-understand"]) == 0
     assert "AlicePassword1" not in stack.layout.events_file.read_text(encoding="utf-8")
+
+
+def test_user_list_masks_password_and_reveal_shows_it(stack):
+    socks_password = "GrafanaSecret99"
+    http_password = "HttpProxySecret1"
+    config = AppConfig(
+        public_ipv4="203.0.113.8",
+        first_run_complete=True,
+        socks=Listener(
+            enabled=True,
+            port=1080,
+            allowlist=["203.0.113.10"],
+            users=[
+                ProxyUser("grafana", "socks:grafana"),
+                ProxyUser("alice", "socks:alice"),
+            ],
+        ),
+        http=Listener(
+            enabled=False,
+            port=3128,
+            users=[ProxyUser("grafana", "http:grafana")],
+        ),
+    )
+    stack.store.save(config)
+    stack.store.save_secrets(
+        {
+            "socks:grafana": socks_password,
+            "socks:alice": "AlicePassword1",
+            "http:grafana": http_password,
+        }
+    )
+    loaded = stack.store.load()
+    secrets = stack.store.load_secrets()
+    assert stack.layout.secrets_file.is_file()
+    assert socks_password in stack.layout.secrets_file.read_text(encoding="utf-8")
+
+    listed = format_user_list("socks", loaded)
+    assert "grafana" in listed
+    assert "alice" in listed
+    assert "1080" in listed
+    assert "включён" in listed
+    assert "203.0.113.10" in listed
+    assert "пароль: ****" in listed
+    assert socks_password not in listed
+    assert http_password not in listed
+    assert "AlicePassword1" not in listed
+
+    http_listed = format_user_list("http", loaded)
+    assert "grafana" in http_listed
+    assert "3128" in http_listed
+    assert "заблокирован" in http_listed
+    assert "allowlist" not in http_listed
+    assert http_password not in http_listed
+    assert socks_password not in http_listed
+
+    shown = reveal_user("socks", "grafana", loaded, secrets)
+    assert socks_password in shown
+    assert "203.0.113.8" in shown
+    assert "1080" in shown
+    assert "grafana" in shown
+    assert "Скопируйте" in shown
+    assert f"socks5://grafana:{socks_password}@203.0.113.8:1080" in shown
+    assert http_password not in shown
+    assert "AlicePassword1" not in shown
+
+    http_shown = reveal_user("http", "grafana", loaded, secrets)
+    assert http_password in http_shown
+    assert "3128" in http_shown
+    assert "203.0.113.8" in http_shown
+    assert socks_password not in http_shown
+
+    unknown = reveal_user("socks", "nobody", loaded, secrets)
+    assert "не найден" in unknown
+    assert socks_password not in unknown
+    assert http_password not in unknown
+
+    empty = reveal_user("socks", "grafana", loaded, {})
+    assert "пуст" in empty
+    assert socks_password not in empty
+
+    missing_file = reveal_user("socks", "grafana", loaded, None)
+    assert "отсутств" in missing_file
+    assert socks_password not in missing_file
+
+    missing_key = reveal_user("socks", "grafana", loaded, {"http:grafana": http_password})
+    assert "не найден" in missing_key
+    assert socks_password not in missing_key
+    assert http_password not in missing_key
+
+    assert "нет" in format_user_list("socks", AppConfig())
+    log_path = stack.layout.events_file
+    log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+    assert socks_password not in log_text
+    assert http_password not in log_text
+
+
+def test_user_menu_holds_list_and_prints_password(stack, monkeypatch, capsys):
+    from proxycli.ui.menu import _users
+
+    socks_password = "GrafanaSecret99"
+    http_password = "HttpProxySecret1"
+    config = AppConfig(
+        public_ipv4="203.0.113.8",
+        first_run_complete=True,
+        socks=Listener(
+            enabled=True,
+            port=1080,
+            allowlist=["198.51.100.20"],
+            users=[ProxyUser("grafana", "socks:grafana")],
+        ),
+        http=Listener(
+            enabled=True,
+            port=3128,
+            users=[ProxyUser("bob", "http:bob")],
+        ),
+    )
+    stack.store.save(config)
+    stack.store.save_secrets({"socks:grafana": socks_password, "http:bob": http_password})
+    holds: list[str] = []
+    monkeypatch.setattr("proxycli.ui.menu.pause", lambda: holds.append("hold"))
+    monkeypatch.setattr("proxycli.ui.menu.copy_secret", lambda *_args, **_kwargs: True)
+
+    def run(kind: str, choices: list[str], names: list[str]) -> str:
+        picked = iter(choices)
+        asked = iter(names)
+        monkeypatch.setattr("proxycli.ui.menu.choose", lambda *_args, **_kwargs: next(picked))
+        monkeypatch.setattr("proxycli.ui.menu.ask_text", lambda *_args, **_kwargs: next(asked))
+        before = len(holds)
+        _users(stack, kind)
+        assert len(holds) > before
+        return capsys.readouterr().out
+
+    socks_list = run("socks", ["list", "back"], [])
+    assert "grafana" in socks_list
+    assert "1080" in socks_list
+    assert "включён" in socks_list
+    assert "198.51.100.20" in socks_list
+    assert "****" in socks_list
+    assert socks_password not in socks_list
+    assert http_password not in socks_list
+
+    socks_reveal = run("socks", ["reveal", "back"], ["grafana"])
+    assert socks_password in socks_reveal
+    assert "203.0.113.8" in socks_reveal
+    assert "1080" in socks_reveal
+    assert "grafana" in socks_reveal
+    assert "Скопируйте" in socks_reveal
+    assert http_password not in socks_reveal
+
+    unknown = run("socks", ["reveal", "back"], ["missing"])
+    assert "не найден" in unknown
+    assert socks_password not in unknown
+
+    http_list = run("http", ["list", "back"], [])
+    assert "bob" in http_list
+    assert "3128" in http_list
+    assert http_password not in http_list
+    assert socks_password not in http_list
+
+    http_reveal = run("http", ["reveal", "back"], ["bob"])
+    assert http_password in http_reveal
+    assert socks_password not in http_reveal
+
+    stack.layout.secrets_file.unlink()
+    missing = run("socks", ["reveal", "back"], ["grafana"])
+    assert "отсутств" in missing
+    assert socks_password not in missing
+
+    stack.store.save_secrets({})
+    empty = run("http", ["reveal", "back"], ["bob"])
+    assert "пуст" in empty
+    assert http_password not in empty
+
+    log_text = stack.layout.events_file.read_text(encoding="utf-8")
+    assert socks_password not in log_text
+    assert http_password not in log_text
+    assert "socks.reveal" in log_text
+    assert "http.reveal" in log_text
 
 
 def test_user_add_rolls_back_secret(stack, monkeypatch):
