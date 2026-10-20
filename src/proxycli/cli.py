@@ -160,6 +160,10 @@ def _proxy_parser(sub: argparse._SubParsersAction, kind: str) -> None:
     allow.add_argument("--user", required=True)
     allow.add_argument("--cidr", required=True)
     allow.set_defaults(func=cmd_proxy_allow, kind=kind)
+    inspect = commands.add_parser("inspect-acl", help="allowlist, ACL без паролей и журнал отказов")
+    inspect.add_argument("--source", help="IP клиента, который нужно проверить")
+    inspect.add_argument("--tail", type=int, default=2000)
+    inspect.set_defaults(func=cmd_proxy_inspect, kind=kind)
     test = commands.add_parser("test")
     test.set_defaults(func=cmd_proxy_test, kind=kind)
     example = commands.add_parser("example")
@@ -342,7 +346,13 @@ def cmd_proxy_allow(args: argparse.Namespace) -> int:
     _warnings(stack.allow_source(args.kind, args.user, args.cidr))
     config = stack.store.load()
     listener = config.socks if args.kind == "socks" else config.http
-    print("allowlist: " + ", ".join(listener.allowlist))
+    print("allowlist (общий для всех пользователей): " + ", ".join(listener.allowlist))
+    return 0
+
+
+def cmd_proxy_inspect(args: argparse.Namespace) -> int:
+    for line in Stack().inspect_acl(args.kind, source=args.source, tail=max(1, args.tail)):
+        print(line)
     return 0
 
 
@@ -489,7 +499,7 @@ def cmd_restart(_args: argparse.Namespace) -> int:
     if stack.offline():
         print("перезапуск пропущен (offline), успех не заявляется")
         return 0
-    _warnings(stack.reload(probe=False))
+    _warnings(stack.reload(probe=False, restart_proxy=True))
     return 0
 
 

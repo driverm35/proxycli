@@ -125,7 +125,15 @@ TLS клиента и не обещает побайтово те же заго�
 sudo proxycli socks add-user --username alice
 sudo proxycli socks reveal --username alice --i-understand
 sudo proxycli socks example --username alice
+sudo proxycli socks allow --user alice --cidr 203.0.113.10
+sudo proxycli socks inspect-acl --source 203.0.113.10
 ```
+
+Allowlist общий для всех пользователей одного прокси: логин и пароль
+нужны всегда, адрес клиента должен входить в список. `inspect-acl` без
+паролей показывает ACL, свежесть контейнера, DNAT Docker и последние отказы
+3proxy с адресом, который 3proxy реально видит. Код 3 значит, что адрес не в
+allowlist, код 6 означает неверный пароль, код 4 означает отсутствие логина.
 
 Пароль в журнале маскируется. В терминале без OSC52 строка для копирования
 печатается только по явному запросу.

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import itertools
 import os
 import uuid
+from datetime import datetime
 
 from proxycli.constants import (
     CADDY_ADMIN,
@@ -14,6 +16,7 @@ from proxycli.constants import (
 from proxycli.errors import ProbeError, ProxyCLIError, RollbackError, ValidationError
 from proxycli.managers.backup import BackupManager
 from proxycli.models.config import AppConfig, ProxyUser, Route
+from proxycli.services import proxyacl
 from proxycli.services.caddyfile import (
     WILDCARD_FALLBACK,
     assert_caddyfile_contains_routes,
@@ -29,7 +32,7 @@ from proxycli.services.probes import (
 )
 from proxycli.services.proxy3cfg import _active, render_3proxy
 from proxycli.services.store import Store, generate_password
-from proxycli.utils.files import atomic_write
+from proxycli.utils.files import atomic_write, chmod
 from proxycli.utils.paths import PathLayout
 from proxycli.utils.proc import OfflineRunner, ProcResult, Runner, make_runner, require_ok
 from proxycli.utils.validation import (
@@ -57,6 +60,7 @@ class Stack:
         self.backup = BackupManager(self.layout)
         self.events = EventLog(self.layout, self.store)
         self._proxy_restarted = False
+        self._proxy_cfg_changed = False
 
     def offline(self) -> bool:
         return isinstance(self.runner, OfflineRunner) or os.environ.get("PROXYCLI_OFFLINE") == "1"
@@ -68,7 +72,7 @@ class Stack:
         proxy = render_3proxy(config, secrets)
         compose = render_compose(config, self.layout.token_file)
         assert_caddyfile_contains_routes(caddy, config)
-        self._write_runtime(caddy, proxy, compose)
+        self._proxy_cfg_changed = self._write_runtime(caddy, proxy, compose)
         return warnings
 
     def reload(
@@ -86,7 +90,7 @@ class Stack:
             warnings.append("offline: Docker и публичный TLS не проверялись, успех не заявляется")
             return warnings
         warnings.extend(self._docker_validate_and_reload())
-        if restart_proxy:
+        if restart_proxy or self._proxy_needs_recreate():
             self._recreate_proxy()
         if probe and probe_hosts and not self._skip_probes():
             config = self.store.load()
@@ -400,7 +404,9 @@ class Stack:
                 fix=f"proxycli {kind} add-user --username {user}",
             )
         if entry in listener.allowlist:
-            return [f"{entry} уже в allowlist. Пароль не менялся."]
+            warnings = self.transaction(f"{kind}-allow", lambda: None, probe=False, restart_proxy=True)
+            warnings.append(f"{entry} уже в allowlist; 3proxy перезапущен с текущим конфигом. Пароль не менялся.")
+            return warnings
 
         def mutate() -> None:
             config = self.store.load()
@@ -415,6 +421,94 @@ class Stack:
         self.events.write(f"{kind}.allow", username=user, cidr=entry)
         warnings.append("Пароль не менялся.")
         return warnings
+
+    def inspect_acl(self, kind: str, source: str | None = None, tail: int = 2000) -> list[str]:
+        """Read-only report: allowlist, ACL without passwords, container and recent 3proxy log."""
+        listener = getattr(self.store.load(), _kind(kind))
+        out = [
+            f"enabled={listener.enabled} port={listener.port} "
+            f"users={','.join(user.username for user in listener.users) or '-'}",
+            "allowlist (общий для всех пользователей этого прокси): "
+            + (", ".join(listener.allowlist) or "пуст, источник не ограничен"),
+        ]
+        if source:
+            address = validate_allowlist([source])[0]
+            if "/" in address:
+                raise ValidationError("для --source нужен один IP, не сеть")
+            verdict = proxyacl.allowed_by(listener.allowlist, address)
+            out.append(
+                f"{address}: "
+                + {True: "входит в allowlist", False: "НЕ входит в allowlist", None: "allowlist пуст"}[verdict]
+            )
+        cfg = self.layout.proxy_cfg
+        if cfg.exists():
+            out.append("ACL в 3proxy.cfg:")
+            out.extend("  " + line for line in proxyacl.acl_lines(cfg.read_text(encoding="utf-8")))
+        else:
+            out.append("3proxy.cfg ещё не создан")
+        if self.offline():
+            out.append("Docker не проверялся (offline)")
+            return out
+        out.append(f"контейнер {PROXY_CONTAINER}: {self.container_state(PROXY_CONTAINER)}")
+        stale = self.proxy_config_stale()
+        if stale:
+            out.append(
+                "ВНИМАНИЕ: 3proxy.cfg новее контейнера, 3proxy работает со старым ACL. "
+                "Исправление: sudo proxycli restart"
+            )
+        elif stale is False:
+            out.append("контейнер запущен после последней записи 3proxy.cfg")
+        gateway = self._proxy_gateway()
+        if gateway:
+            out.append(f"шлюз Docker-сети proxycli: {gateway}")
+        out.append(self._dnat_note(listener.port))
+        logs = self.runner(["docker", "logs", "--tail", str(tail), PROXY_CONTAINER], timeout=20)
+        entries = proxyacl.parse_log(f"{logs.stdout}\n{logs.stderr}", listener.port) if logs.ok else []
+        if not logs.ok:
+            out.append("журнал 3proxy недоступен: docker logs завершился с ошибкой")
+        elif not entries:
+            out.append("в журнале 3proxy нет подключений к этому порту")
+        else:
+            out.append(f"последние подключения (из {len(entries)} строк журнала, пароли не пишутся):")
+            out.extend("  " + row for row in proxyacl.summarize(entries))
+            clients = {entry.client for entry in entries}
+            if gateway and gateway in clients:
+                out.append(
+                    f"ВНИМАНИЕ: 3proxy видит адрес шлюза {gateway} вместо адреса клиента. "
+                    "Docker не сохраняет источник (нет DNAT, работает userland-proxy), "
+                    "поэтому allowlist по IP не сработает."
+                )
+            if source and address not in clients:
+                out.append(
+                    f"подключений с {address} в журнале нет: клиент выходит с другого IP "
+                    "или пакеты не доходят до 3proxy (firewall, маршрут)"
+                )
+        return out
+
+    def _proxy_gateway(self) -> str:
+        result = self.runner(
+            ["docker", "network", "inspect", "-f", "{{range .IPAM.Config}}{{.Gateway}} {{end}}", "proxycli"],
+            timeout=8,
+        )
+        if not result.ok:
+            return ""
+        return next(iter(result.stdout.split()), "")
+
+    def _dnat_note(self, port: int) -> str:
+        try:
+            result = self.runner(["iptables", "-t", "nat", "-S", "DOCKER"], timeout=8)
+        except ProxyCLIError:
+            return "DNAT Docker не проверен: нет iptables"
+        if not result.ok:
+            return "DNAT Docker не проверен: iptables -t nat -S DOCKER завершился с ошибкой"
+        marker = f"--dport {port} "
+        if any(marker in line and "DNAT" in line for line in result.stdout.splitlines()):
+            return f"DNAT Docker для порта {port} есть: адрес клиента сохраняется"
+        return (
+            f"ВНИМАНИЕ: DNAT Docker для порта {port} в iptables не найден. Если Docker не использует "
+            "nftables-бэкенд, подключения идут через userland-proxy и 3proxy видит адрес шлюза. "
+            "Проверьте /etc/docker/daemon.json и не сбрасывает ли nftables.service правила Docker"
+        )
 
     def _require_ready(self) -> AppConfig:
         config = self.store.load()
@@ -505,13 +599,24 @@ class Stack:
             if original.fix.startswith("proxycli backup restore"):
                 original.fix = ""
 
-    def _write_runtime(self, caddy: str, proxy: str, compose: str) -> None:
+    def _write_runtime(self, caddy: str, proxy: str, compose: str) -> bool:
+        """Write runtime files; return True when 3proxy.cfg content changed.
+
+        An unchanged 3proxy.cfg keeps its mtime so it can be compared with the
+        container start time.
+        """
         self.layout.ensure_dirs()
         atomic_write(self.layout.caddyfile, caddy, 0o644)
-        atomic_write(self.layout.proxy_cfg, proxy, 0o600)
+        cfg = self.layout.proxy_cfg
+        previous = cfg.read_text(encoding="utf-8") if cfg.exists() else None
+        if previous != proxy:
+            atomic_write(cfg, proxy, 0o600)
+        else:
+            chmod(cfg, 0o600)
         atomic_write(self.layout.compose_file, compose, 0o644)
         atomic_write(self.layout.dockerfile, render_dockerfile(), 0o644)
         atomic_write(self.layout.entrypoint, ENTRYPOINT, 0o755)
+        return previous != proxy
 
     def _docker_validate_and_reload(self) -> list[str]:
         config = self.store.load()
@@ -591,6 +696,25 @@ class Stack:
                 fix="docker inspect proxycli-3proxy",
             )
 
+    def _proxy_needs_recreate(self) -> bool:
+        """3proxy.cfg is a single-file bind mount: an atomic rename is invisible
+        to the running container, so any newer file needs a recreate."""
+        stale = self.proxy_config_stale()
+        return self._proxy_cfg_changed if stale is None else stale
+
+    def proxy_config_stale(self) -> bool | None:
+        """True if 3proxy.cfg is newer than the running container; None if unknown."""
+        if self.offline() or not self.layout.proxy_cfg.exists():
+            return None
+        result = self.runner(
+            ["docker", "inspect", "-f", "{{.State.StartedAt}}", PROXY_CONTAINER],
+            timeout=8,
+        )
+        started = _docker_time(result.stdout) if result.ok else None
+        if started is None:
+            return None
+        return self.layout.proxy_cfg.stat().st_mtime > started
+
     def _compose(self, *args: str) -> list[str]:
         return [
             "docker",
@@ -640,6 +764,23 @@ def _admin_not_listening(result: ProcResult) -> bool:
     if "is not running" in text or "no such container" in text:
         return True
     return "i/o timeout" in text or "context deadline exceeded" in text
+
+
+def _docker_time(text: str) -> float | None:
+    """Parse docker StartedAt (RFC 3339 with nanoseconds) into a Unix timestamp."""
+    value = text.strip()
+    if not value or value.startswith("0001-"):
+        return None
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    if "." in value:
+        head, rest = value.split(".", 1)
+        digits = "".join(itertools.takewhile(str.isdigit, rest))
+        value = f"{head}.{digits[:6].ljust(6, '0')}{rest[len(digits):]}"
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
 
 
 def _kind(kind: str) -> str:

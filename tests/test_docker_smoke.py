@@ -66,6 +66,104 @@ def test_docker_proxy_auth_and_ssrf(tmp_path: Path):
         subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
 
 
+CURL_IMAGE = "curlimages/curl:8.10.1"
+
+
+@pytest.mark.skipif(not _docker_ok(), reason="Docker недоступен: проверка allowlist 3proxy пропущена")
+def test_docker_socks_allowlist_by_source_ip(tmp_path: Path):
+    """Real 3proxy with the generated ACL; clients get fixed source IPs on a private network.
+
+    Code 3 means the ACL rejected the source; any other code for the allowed
+    client means it passed auth and the ACL (the target may still be unreachable
+    without internet).
+    """
+    subnet, proxy_ip, allowed_ip, denied_ip = "172.31.211.0/24", "172.31.211.2", "172.31.211.10", "172.31.211.20"
+    config = AppConfig(
+        socks=Listener(
+            enabled=True,
+            port=1080,
+            allowlist=["198.51.100.20", allowed_ip],
+            users=[ProxyUser("grafana", "socks:grafana"), ProxyUser("alice", "socks:alice")],
+        )
+    )
+    secret = "GrafanaSmoke123"
+    cfg = tmp_path / "3proxy.cfg"
+    cfg.write_text(
+        render_3proxy(config, {"socks:grafana": secret, "socks:alice": "AlicePassword1"}),
+        encoding="utf-8",
+        newline="\n",
+    )
+    for image in (THREEPROXY_IMAGE, CURL_IMAGE):
+        pull = subprocess.run(["docker", "pull", image], capture_output=True, text=True, timeout=180)
+        if pull.returncode != 0:
+            pytest.skip(f"образ {image} не скачан: {pull.stderr.strip()}")
+    network, name = "proxycli-acl-test", "proxycli-acl-test"
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+    subprocess.run(["docker", "network", "rm", network], capture_output=True, text=True)
+    made = subprocess.run(
+        ["docker", "network", "create", "--subnet", subnet, network], capture_output=True, text=True, timeout=30
+    )
+    if made.returncode != 0:
+        pytest.skip(f"сеть {subnet} не создана: {made.stderr.strip()}")
+    try:
+        run = subprocess.run(
+            [
+                "docker", "run", "-d", "--name", name, "--read-only",
+                "--network", network, "--ip", proxy_ip,
+                "-v", f"{cfg.resolve().as_posix()}:/etc/3proxy/3proxy.cfg:ro",
+                THREEPROXY_IMAGE,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert run.returncode == 0, run.stderr
+        time.sleep(1)
+
+        def client(source: str, auth: str) -> None:
+            subprocess.run(
+                [
+                    "docker", "run", "--rm", "--network", network, "--ip", source, CURL_IMAGE,
+                    "-s", "-o", "/dev/null", "--max-time", "8",
+                    "--socks5", f"{auth}{proxy_ip}:1080", "http://1.1.1.1/",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+        client(allowed_ip, f"grafana:{secret}@")
+        client(denied_ip, f"grafana:{secret}@")
+        client(allowed_ip, "grafana:WrongPassword9@")
+        client(allowed_ip, "")
+        entries = _acl_entries(name, expected=4)
+        codes = {(item.client, item.code) for item in entries}
+        assert (denied_ip, 3) in codes
+        assert (allowed_ip, 6) in codes
+        assert (allowed_ip, 4) in codes
+        allowed = [item.code for item in entries if item.client == allowed_ip and item.user == "grafana"]
+        assert any(code not in {1, 3, 4, 5, 6} for code in allowed), entries
+        logs = subprocess.run(["docker", "logs", name], capture_output=True, text=True, timeout=20)
+        assert secret not in logs.stdout + logs.stderr
+    finally:
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+        subprocess.run(["docker", "network", "rm", network], capture_output=True, text=True)
+
+
+def _acl_entries(name: str, expected: int) -> list:
+    from proxycli.services.proxyacl import parse_log
+
+    deadline = time.time() + 30
+    entries: list = []
+    while time.time() < deadline:
+        logs = subprocess.run(["docker", "logs", name], capture_output=True, text=True, timeout=20)
+        entries = parse_log(logs.stdout + logs.stderr, 1080)
+        if len(entries) >= expected:
+            return entries
+        time.sleep(1)
+    return entries
+
+
 @pytest.mark.skipif(not _docker_ok(), reason="Docker недоступен: проверка caddy reload пропущена")
 def test_caddy_reload_address_is_ipv4_admin(tmp_path: Path):
     caddyfile = tmp_path / "Caddyfile"

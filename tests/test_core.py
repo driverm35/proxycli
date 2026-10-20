@@ -819,6 +819,188 @@ def test_socks_allow_recreates_proxy_and_rolls_back(layout, monkeypatch):
     assert len(recreates) == 2
 
 
+class _DockerFake:
+    """Answers docker inspect/logs/network and iptables like a VPS would."""
+
+    def __init__(self, started_at: str = "", logs: str = "", dnat_port: int | None = 1080) -> None:
+        self.calls: list[list[str]] = []
+        self.started_at = started_at
+        self.logs = logs
+        self.dnat_port = dnat_port
+
+    def __call__(self, argv: list[str], timeout: float = 30) -> ProcResult:
+        self.calls.append(list(argv))
+        if argv[:2] == ["docker", "inspect"]:
+            if "{{.State.StartedAt}}" in argv:
+                return ProcResult(0, self.started_at + "\n", "") if self.started_at else ProcResult(1, "", "")
+            return ProcResult(0, "running\n", "")
+        if argv[:2] == ["docker", "logs"]:
+            return ProcResult(0, self.logs, "")
+        if argv[:3] == ["docker", "network", "inspect"]:
+            return ProcResult(0, "172.18.0.1 \n", "")
+        if argv[0] == "iptables":
+            rules = "-N DOCKER\n"
+            if self.dnat_port:
+                rules += (
+                    f"-A DOCKER ! -i br-x -p tcp -m tcp --dport {self.dnat_port} "
+                    "-j DNAT --to-destination 172.18.0.3:1080\n"
+                )
+            return ProcResult(0, rules, "")
+        return ProcResult(0, "", "")
+
+    def recreates(self) -> int:
+        return sum(1 for call in self.calls if "--force-recreate" in call and "proxy3" in call)
+
+
+def _iso(ts: float) -> str:
+    from datetime import UTC, datetime
+
+    return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%dT%H:%M:%S.%f") + "123Z"
+
+
+def test_docker_started_at_parses_nanoseconds():
+    from datetime import UTC, datetime
+
+    from proxycli.managers.stack import _docker_time
+
+    expected = datetime(2026, 10, 20, 17, 59, 52, 123456, tzinfo=UTC).timestamp()
+    assert _docker_time("2026-10-20T17:59:52.123456789Z\n") == pytest.approx(expected)
+    assert _docker_time("0001-01-01T00:00:00Z") is None
+    assert _docker_time("running") is None
+
+
+def test_listener_change_recreates_proxy_because_bind_mount_hides_new_file(layout, monkeypatch):
+    runner = _DockerFake()
+    stack = _online_stack(layout, monkeypatch, runner)
+    config, secret = _grafana_allow_config()
+    stack.store.save(config)
+    stack.store.save_secrets({"socks:grafana": secret, "socks:alice": "AlicePassword1"})
+    stack.configure_listener("socks", allowlist=["135.106.140.226"])
+    assert runner.recreates() == 1
+    assert "allow grafana,alice 135.106.140.226" in stack.layout.proxy_cfg.read_text(encoding="utf-8")
+
+
+def test_reload_skips_recreate_when_container_is_newer_than_cfg(layout, monkeypatch):
+    config, secret = _grafana_allow_config()
+    runner = _DockerFake()
+    stack = _online_stack(layout, monkeypatch, runner)
+    stack.store.save(config)
+    stack.store.save_secrets({"socks:grafana": secret, "socks:alice": "AlicePassword1"})
+    stack.render()
+    mtime = stack.layout.proxy_cfg.stat().st_mtime
+    runner.started_at = _iso(mtime + 60)
+    stack.reload(probe=False)
+    assert stack.layout.proxy_cfg.stat().st_mtime == mtime
+    assert runner.recreates() == 0
+    runner.started_at = _iso(mtime - 60)
+    stack.reload(probe=False)
+    assert runner.recreates() == 1
+
+
+def test_socks_allow_existing_entry_still_applies_to_stale_container(layout, monkeypatch, capsys):
+    runner = _DockerFake(started_at="2020-01-01T00:00:00.000000000Z")
+    stack = _online_stack(layout, monkeypatch, runner)
+    config, secret = _grafana_allow_config()
+    config.socks.allowlist.append("135.106.140.226")
+    stack.store.save(config)
+    stack.store.save_secrets({"socks:grafana": secret, "socks:alice": "AlicePassword1"})
+    stack.render()
+    before = stack.layout.secrets_file.read_bytes()
+    warnings = stack.allow_source("socks", "grafana", "135.106.140.226")
+    assert runner.recreates() == 1
+    assert any("уже в allowlist" in item and "перезапущен" in item for item in warnings)
+    assert stack.store.load().socks.allowlist.count("135.106.140.226") == 1
+    assert stack.layout.secrets_file.read_bytes() == before
+
+
+def test_restart_command_recreates_proxy(layout, monkeypatch):
+    runner = _DockerFake(started_at="2999-01-01T00:00:00Z")
+    stack = _online_stack(layout, monkeypatch, runner)
+    config, secret = _grafana_allow_config()
+    stack.store.save(config)
+    stack.store.save_secrets({"socks:grafana": secret, "socks:alice": "AlicePassword1"})
+    monkeypatch.setattr("proxycli.cli.Stack", lambda: stack)
+    assert main(["restart"]) == 0
+    assert runner.recreates() == 1
+
+
+_REAL_3PROXY_LOG = """\
+261020175709.476 1080 00000 - 0.0.0.0:1080 0.0.0.0:0 0 0 0 Accepting connections [1/129471162738368]
+261020175715.061 1080 00003 grafana 172.18.0.1:47246 149.154.167.99:443 0 0 0 CONNECT api.telegram.org:443
+261020175716.061 1080 00003 grafana 172.18.0.1:47250 149.154.167.99:443 0 0 0 CONNECT api.telegram.org:443
+261020175715.772 1080 00006 grafana 198.51.100.7:39952 149.154.167.99:443 0 0 0 CONNECT api.telegram.org:443
+261020175716.490 1080 00004 - 198.51.100.7:39960 0.0.0.0:0 0 0 0 UNKNOWN 0.0.0.0:0
+261020175719.354 1080 00000 alice 203.0.113.10:39950 149.154.167.99:80 76 240 0 CONNECT telegram.org:80
+261020175720.000 3128 00003 bob 192.0.2.9:1 1.1.1.1:443 0 0 0 CONNECT 1.1.1.1:443
+"""
+
+
+def test_parse_3proxy_log_reads_source_and_code():
+    from proxycli.services.proxyacl import parse_log, summarize
+
+    entries = parse_log(_REAL_3PROXY_LOG, 1080)
+    assert [(item.client, item.code) for item in entries] == [
+        ("172.18.0.1", 3),
+        ("172.18.0.1", 3),
+        ("198.51.100.7", 6),
+        ("198.51.100.7", 4),
+        ("203.0.113.10", 0),
+    ]
+    rows = summarize(entries)
+    assert rows[0].startswith("203.0.113.10 user=alice код 0")
+    assert any("172.18.0.1 user=grafana код 3" in row and "2 раз" in row for row in rows)
+    assert any("неверный пароль" in row for row in rows)
+
+
+def test_acl_lines_hide_passwords():
+    from proxycli.services.proxyacl import acl_lines
+
+    config, secret = _grafana_allow_config()
+    text = render_3proxy(config, {"socks:grafana": secret, "socks:alice": "AlicePassword1"})
+    shown = "\n".join(acl_lines(text))
+    assert secret not in shown and "AlicePassword1" not in shown and ":CL:" not in shown
+    assert "users grafana alice" in shown
+    assert "allow grafana,alice 203.0.113.10,198.51.100.20" in shown
+    assert "auth strong" in shown and "socks -p1080 -n -u2" in shown
+
+
+def test_inspect_acl_reports_gateway_source_and_missing_prod_ip(layout, monkeypatch, capsys):
+    runner = _DockerFake(started_at="2999-01-01T00:00:00Z", logs=_REAL_3PROXY_LOG)
+    stack = _online_stack(layout, monkeypatch, runner)
+    config, secret = _grafana_allow_config()
+    config.socks.allowlist.append("135.106.140.226")
+    stack.store.save(config)
+    stack.store.save_secrets({"socks:grafana": secret, "socks:alice": "AlicePassword1"})
+    stack.render()
+    monkeypatch.setattr("proxycli.cli.Stack", lambda: stack)
+    assert main(["socks", "inspect-acl", "--source", "135.106.140.226"]) == 0
+    out = capsys.readouterr().out
+    assert secret not in out and "AlicePassword1" not in out
+    assert "135.106.140.226: входит в allowlist" in out
+    assert "allow grafana,alice 203.0.113.10,198.51.100.20,135.106.140.226" in out
+    assert "контейнер запущен после последней записи" in out
+    assert "DNAT Docker для порта 1080 есть" in out
+    assert "адрес шлюза 172.18.0.1" in out
+    assert "подключений с 135.106.140.226 в журнале нет" in out
+    assert "код 3 (нет подходящего allow" in out
+    assert "3128" not in out.split("последние подключения")[1]
+
+
+def test_inspect_acl_flags_stale_container_and_missing_dnat(layout, monkeypatch):
+    runner = _DockerFake(started_at="2020-01-01T00:00:00Z", dnat_port=None)
+    stack = _online_stack(layout, monkeypatch, runner)
+    config, secret = _grafana_allow_config()
+    stack.store.save(config)
+    stack.store.save_secrets({"socks:grafana": secret, "socks:alice": "AlicePassword1"})
+    stack.render()
+    text = "\n".join(stack.inspect_acl("socks", source="8.8.8.8"))
+    assert "8.8.8.8: НЕ входит в allowlist" in text
+    assert "3proxy.cfg новее контейнера" in text
+    assert "DNAT Docker для порта 1080 в iptables не найден" in text
+    with pytest.raises(ValidationError):
+        stack.inspect_acl("socks", source="10.0.0.0/8")
+
+
 def test_socks_menu_allow_does_not_show_password(stack, monkeypatch, capsys):
     from proxycli.ui.menu import _users
 
