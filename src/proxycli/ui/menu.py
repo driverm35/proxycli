@@ -159,6 +159,7 @@ def _users(stack: Stack, kind: str) -> None:
                 ("add", "Создать пользователя"),
                 ("list", "Список"),
                 ("reveal", "Показать пароль"),
+                ("allow", "Разрешить IP"),
                 ("delete", "Удалить"),
                 ("back", "Назад"),
             ],
@@ -185,6 +186,22 @@ def _users(stack: Stack, kind: str) -> None:
             out.print(f"Пароль (скопируйте строку): {password}", markup=False, highlight=False)
             copy_secret(password)
             pause()
+            continue
+        if choice == "allow":
+            cidr = ask_text("IP или CIDR клиента")
+            if not cidr:
+                continue
+            try:
+                warnings = stack.allow_source(kind, username, cidr)
+            except ProxyCLIError as exc:
+                out.print(f"Ошибка: {exc}", markup=False, highlight=False)
+                if exc.fix:
+                    out.print(f"Что сделать: {exc.fix}", markup=False, highlight=False)
+                pause()
+                continue
+            for warning in warnings:
+                out.print(warning, markup=False, highlight=False)
+            _show_until_enter(out, "Пароль не менялся и на экран не выводится.")
             continue
         if choice == "reveal":
             if stack.store.layout.secrets_file.exists():

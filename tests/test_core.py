@@ -700,6 +700,146 @@ def test_user_menu_holds_list_and_prints_password(stack, monkeypatch, capsys):
     assert "http.reveal" in log_text
 
 
+def _grafana_allow_config() -> tuple[AppConfig, str]:
+    secret = "AllowListSecret1"
+    config = AppConfig(
+        public_ipv4="203.0.113.8",
+        first_run_complete=True,
+        socks=Listener(
+            enabled=True,
+            port=1080,
+            allowlist=["203.0.113.10", "198.51.100.20"],
+            users=[
+                ProxyUser("grafana", "socks:grafana"),
+                ProxyUser("alice", "socks:alice"),
+            ],
+        ),
+    )
+    return config, secret
+
+
+def test_socks_allow_adds_cidr_without_changing_password(stack, capsys):
+    config, secret = _grafana_allow_config()
+    config.http = Listener(
+        enabled=True,
+        port=3128,
+        allowlist=["192.0.2.10"],
+        users=[ProxyUser("bob", "http:bob")],
+    )
+    stack.store.save(config)
+    stack.store.save_secrets(
+        {"socks:grafana": secret, "socks:alice": "AlicePassword1", "http:bob": "HttpProxySecret1"}
+    )
+    before = stack.layout.secrets_file.read_bytes()
+    assert main(["socks", "allow", "--user", "grafana", "--cidr", "135.106.140.226"]) == 0
+    loaded = stack.store.load()
+    assert loaded.socks.allowlist == ["203.0.113.10", "198.51.100.20", "135.106.140.226"]
+    assert [user.username for user in loaded.socks.users] == ["grafana", "alice"]
+    assert loaded.http.allowlist == ["192.0.2.10"]
+    assert stack.layout.secrets_file.read_bytes() == before
+    assert stack.store.load_secrets()["socks:grafana"] == secret
+    text = stack.layout.proxy_cfg.read_text(encoding="utf-8")
+    assert "allow grafana,alice 203.0.113.10,198.51.100.20,135.106.140.226" in text
+    assert "allow bob 192.0.2.10" in text
+    assert "allow *" not in text
+    assert "auth none" not in text
+    assert "auth strong" in text
+    assert "deny * * 127.0.0.0/8" in text
+    assert "deny * * 169.254.0.0/16" in text
+    captured = capsys.readouterr()
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert secret not in stack.layout.config_file.read_text(encoding="utf-8")
+    assert secret not in stack.layout.events_file.read_text(encoding="utf-8")
+    assert main(["socks", "allow", "--user", "grafana", "--cidr", "135.106.140.226"]) == 0
+    assert stack.store.load().socks.allowlist.count("135.106.140.226") == 1
+    assert stack.layout.secrets_file.read_bytes() == before
+
+
+def test_socks_allow_rejects_invalid_cidr(stack, capsys):
+    config, secret = _grafana_allow_config()
+    stack.store.save(config)
+    stack.store.save_secrets({"socks:grafana": secret, "socks:alice": "AlicePassword1"})
+    before = stack.layout.secrets_file.read_bytes()
+    for junk in ("not-an-ip", "999.1.1.1", "0.0.0.0/0", "*", "135.106.140.226;id"):
+        assert main(["socks", "allow", "--user", "grafana", "--cidr", junk]) == 2
+    assert main(["socks", "allow", "--user", "nobody", "--cidr", "203.0.113.50"]) == 2
+    assert stack.store.load().socks.allowlist == ["203.0.113.10", "198.51.100.20"]
+    assert stack.layout.secrets_file.read_bytes() == before
+    captured = capsys.readouterr()
+    assert secret not in captured.out
+    assert secret not in captured.err
+
+
+def test_socks_allow_reload_failure_restores_config(stack, monkeypatch):
+    config, secret = _grafana_allow_config()
+    stack.store.save(config)
+    stack.store.save_secrets({"socks:grafana": secret, "socks:alice": "AlicePassword1"})
+    stack.render()
+    previous = stack.layout.proxy_cfg.read_text(encoding="utf-8")
+    before = stack.layout.secrets_file.read_bytes()
+    assert "135.106.140.226" not in previous
+    monkeypatch.setenv("PROXYCLI_FAIL_STEP", "reload")
+    assert main(["socks", "allow", "--user", "grafana", "--cidr", "135.106.140.226"]) == 1
+    assert stack.store.load().socks.allowlist == ["203.0.113.10", "198.51.100.20"]
+    assert stack.layout.proxy_cfg.read_text(encoding="utf-8") == previous
+    assert stack.layout.secrets_file.read_bytes() == before
+
+
+def test_socks_allow_recreates_proxy_and_rolls_back(layout, monkeypatch):
+    class _Runner:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def __call__(self, argv: list[str], timeout: float = 30) -> ProcResult:
+            self.calls.append(list(argv))
+            if "--force-recreate" in argv and "proxy3" in argv and not getattr(self, "failed", False):
+                self.failed = True
+                return ProcResult(1, "", "recreate failed")
+            if argv[:2] == ["docker", "inspect"]:
+                return ProcResult(0, "running\n", "")
+            return ProcResult(0, "", "")
+
+    runner = _Runner()
+    stack = _online_stack(layout, monkeypatch, runner)
+    config, secret = _grafana_allow_config()
+    stack.store.save(config)
+    stack.store.save_secrets({"socks:grafana": secret, "socks:alice": "AlicePassword1"})
+    before = stack.layout.secrets_file.read_bytes()
+    with pytest.raises(ProxyCLIError) as caught:
+        stack.allow_source("socks", "grafana", "135.106.140.226")
+    assert "recreate failed" in str(caught.value)
+    assert "Файлы возвращены" in str(caught.value)
+    assert stack.store.load().socks.allowlist == ["203.0.113.10", "198.51.100.20"]
+    assert "135.106.140.226" not in stack.layout.proxy_cfg.read_text(encoding="utf-8")
+    assert stack.layout.secrets_file.read_bytes() == before
+    if stack.layout.events_file.exists():
+        assert secret not in stack.layout.events_file.read_text(encoding="utf-8")
+    recreates = [call for call in runner.calls if "--force-recreate" in call and "proxy3" in call]
+    assert len(recreates) == 2
+
+
+def test_socks_menu_allow_does_not_show_password(stack, monkeypatch, capsys):
+    from proxycli.ui.menu import _users
+
+    config, secret = _grafana_allow_config()
+    stack.store.save(config)
+    stack.store.save_secrets({"socks:grafana": secret, "socks:alice": "AlicePassword1"})
+    monkeypatch.setattr("proxycli.ui.menu.pause", lambda: None)
+    choices = iter(["allow", "allow", "back"])
+    answers = iter(["grafana", "135.106.140.226", "grafana", "not-an-ip"])
+    monkeypatch.setattr("proxycli.ui.menu.choose", lambda *_args, **_kwargs: next(choices))
+    monkeypatch.setattr("proxycli.ui.menu.ask_text", lambda *_args, **_kwargs: next(answers))
+    _users(stack, "socks")
+    captured = capsys.readouterr()
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert "Пароль не менялся" in captured.out
+    assert "некорректный IP" in captured.out
+    assert stack.store.load().socks.allowlist == ["203.0.113.10", "198.51.100.20", "135.106.140.226"]
+    assert stack.store.load_secrets()["socks:grafana"] == secret
+
+
 def test_user_add_rolls_back_secret(stack, monkeypatch):
     _wizard()
     monkeypatch.setenv("PROXYCLI_FAIL_STEP", "reload")

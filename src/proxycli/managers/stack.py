@@ -9,6 +9,7 @@ from proxycli.constants import (
     CADDY_DNS_IMAGE,
     CADDY_DNS_MODULE,
     CADDY_IMAGE,
+    PROXY_CONTAINER,
 )
 from proxycli.errors import ProbeError, ProxyCLIError, RollbackError, ValidationError
 from proxycli.managers.backup import BackupManager
@@ -26,7 +27,7 @@ from proxycli.services.probes import (
     probe_public_https,
     probe_upstream,
 )
-from proxycli.services.proxy3cfg import render_3proxy
+from proxycli.services.proxy3cfg import _active, render_3proxy
 from proxycli.services.store import Store, generate_password
 from proxycli.utils.files import atomic_write
 from proxycli.utils.paths import PathLayout
@@ -55,6 +56,7 @@ class Stack:
         self.store = Store(self.layout)
         self.backup = BackupManager(self.layout)
         self.events = EventLog(self.layout, self.store)
+        self._proxy_restarted = False
 
     def offline(self) -> bool:
         return isinstance(self.runner, OfflineRunner) or os.environ.get("PROXYCLI_OFFLINE") == "1"
@@ -75,6 +77,7 @@ class Stack:
         probe_hosts: list[str] | None = None,
         probe: bool = True,
         simulate_failure: bool = True,
+        restart_proxy: bool = False,
     ) -> list[str]:
         warnings = self.render()
         if simulate_failure and self._fail_step() == "reload":
@@ -83,6 +86,8 @@ class Stack:
             warnings.append("offline: Docker и публичный TLS не проверялись, успех не заявляется")
             return warnings
         warnings.extend(self._docker_validate_and_reload())
+        if restart_proxy:
+            self._recreate_proxy()
         if probe and probe_hosts and not self._skip_probes():
             config = self.store.load()
             for host in probe_hosts:
@@ -107,11 +112,12 @@ class Stack:
         *,
         probe_hosts: list[str] | None = None,
         probe: bool = False,
+        restart_proxy: bool = False,
     ) -> list[str]:
         snap = self.backup.create(reason)
         try:
             mutate()
-            return self.reload(probe_hosts=probe_hosts, probe=probe)
+            return self.reload(probe_hosts=probe_hosts, probe=probe, restart_proxy=restart_proxy)
         except Exception as exc:
             self._rollback(snap, exc, reason=reason)
             raise
@@ -381,6 +387,35 @@ class Stack:
         self.events.write(f"{kind}.configure")
         return warnings
 
+    def allow_source(self, kind: str, username: str, cidr: str) -> list[str]:
+        """Append one client IP or CIDR. Does not rotate or read the password."""
+        user = validate_username(username)
+        entry = validate_allowlist([cidr])[0]
+        listener_name = _kind(kind)
+        current = self.store.load()
+        listener = getattr(current, listener_name)
+        if listener.user(user) is None:
+            raise ValidationError(
+                f"пользователь {user} не найден",
+                fix=f"proxycli {kind} add-user --username {user}",
+            )
+        if entry in listener.allowlist:
+            return [f"{entry} уже в allowlist. Пароль не менялся."]
+
+        def mutate() -> None:
+            config = self.store.load()
+            target = getattr(config, listener_name)
+            if target.user(user) is None:
+                raise ValidationError(f"пользователь {user} не найден")
+            if entry not in target.allowlist:
+                target.allowlist.append(entry)
+            self.store.save(config)
+
+        warnings = self.transaction(f"{kind}-allow", mutate, probe=False, restart_proxy=True)
+        self.events.write(f"{kind}.allow", username=user, cidr=entry)
+        warnings.append("Пароль не менялся.")
+        return warnings
+
     def _require_ready(self) -> AppConfig:
         config = self.store.load()
         if not config.first_run_complete or not config.wildcard_domain:
@@ -445,6 +480,20 @@ class Stack:
                 f"{original}. Откат файлов не удался: {exc}",
                 fix=f"proxycli backup restore --id {snap}",
             ) from original
+        if self._proxy_restarted and not self.offline():
+            self._proxy_restarted = False
+            try:
+                self.render()
+                self._recreate_proxy()
+            except Exception as exc:
+                note = f"Контейнер 3proxy не перечитан после отката: {exc}"
+                if isinstance(original, ProxyCLIError):
+                    original.message = f"{original.message} {note}"
+                else:
+                    raise RollbackError(
+                        f"{original}. {note}",
+                        fix=f"proxycli backup restore --id {snap}",
+                    ) from original
         if isinstance(original, ProxyCLIError) and snap not in original.message:
             restored = (
                 f"Файлы возвращены из копии {snap}; повторное восстановление не обязательно."
@@ -525,6 +574,22 @@ class Stack:
             ]
         require_ok(reloaded, reload)
         return []
+
+    def _recreate_proxy(self) -> None:
+        config = self.store.load()
+        if not (_active(config.socks) or _active(config.http)):
+            return
+        if self.offline():
+            return
+        self._proxy_restarted = True
+        argv = self._compose("up", "-d", "--force-recreate", "--no-deps", "proxy3")
+        require_ok(self.runner(argv, timeout=180), argv)
+        state = self.container_state(PROXY_CONTAINER)
+        if state != "running":
+            raise ProxyCLIError(
+                f"контейнер 3proxy не запущен после перезапуска (состояние: {state})",
+                fix="docker inspect proxycli-3proxy",
+            )
 
     def _compose(self, *args: str) -> list[str]:
         return [

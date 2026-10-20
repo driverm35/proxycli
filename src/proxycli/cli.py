@@ -156,6 +156,10 @@ def _proxy_parser(sub: argparse._SubParsersAction, kind: str) -> None:
     configure.add_argument("--enable", action="store_true")
     configure.add_argument("--disable", action="store_true")
     configure.set_defaults(func=cmd_proxy_set, kind=kind)
+    allow = commands.add_parser("allow", help="добавить один IP или CIDR в allowlist")
+    allow.add_argument("--user", required=True)
+    allow.add_argument("--cidr", required=True)
+    allow.set_defaults(func=cmd_proxy_allow, kind=kind)
     test = commands.add_parser("test")
     test.set_defaults(func=cmd_proxy_test, kind=kind)
     example = commands.add_parser("example")
@@ -330,6 +334,15 @@ def cmd_proxy_set(args: argparse.Namespace) -> int:
     enabled = True if args.enable else False if args.disable else None
     allow = [] if args.clear_allow else (args.allow or None)
     _warnings(Stack().configure_listener(args.kind, port=args.port, allowlist=allow, enabled=enabled))
+    return 0
+
+
+def cmd_proxy_allow(args: argparse.Namespace) -> int:
+    stack = Stack()
+    _warnings(stack.allow_source(args.kind, args.user, args.cidr))
+    config = stack.store.load()
+    listener = config.socks if args.kind == "socks" else config.http
+    print("allowlist: " + ", ".join(listener.allowlist))
     return 0
 
 
