@@ -173,6 +173,13 @@ def _proxy_parser(sub: argparse._SubParsersAction, kind: str) -> None:
     reveal.add_argument("--username", required=True)
     reveal.add_argument("--i-understand", action="store_true")
     reveal.set_defaults(func=cmd_reveal, kind=kind)
+    if kind == "socks":
+        change_port = commands.add_parser(
+            "port",
+            help="сменить порт SOCKS5, не трогая пользователей и allowlist",
+        )
+        change_port.add_argument("port", help="новый порт, например 18443")
+        change_port.set_defaults(func=cmd_socks_port)
 
 
 def cmd_default(_args: argparse.Namespace) -> int:
@@ -198,6 +205,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                     "version": __version__,
                     "caddy": stack.container_state("proxycli-caddy"),
                     "routes": len(config.routes),
+                    "socks_port": config.socks.port,
                     "domain": config.wildcard_domain,
                     "tls_mode": config.tls.mode,
                     "dns_plugin_ready": config.tls.dns_plugin_ready,
@@ -338,6 +346,15 @@ def cmd_proxy_set(args: argparse.Namespace) -> int:
     enabled = True if args.enable else False if args.disable else None
     allow = [] if args.clear_allow else (args.allow or None)
     _warnings(Stack().configure_listener(args.kind, port=args.port, allowlist=allow, enabled=enabled))
+    return 0
+
+
+def cmd_socks_port(args: argparse.Namespace) -> int:
+    stack = Stack()
+    _warnings(stack.set_socks_port(args.port))
+    config = stack.store.load()
+    username = config.socks.users[0].username if config.socks.users else "USER"
+    print(socks_example(config.public_ipv4 or "SERVER_IP", config.socks.port, username))
     return 0
 
 

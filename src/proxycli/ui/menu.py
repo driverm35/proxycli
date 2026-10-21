@@ -153,23 +153,25 @@ def _users(stack: Stack, kind: str) -> None:
     if kind == "http":
         out.print(CLEARTEXT_WARNING)
     while True:
-        choice = choose(
-            "SOCKS5" if kind == "socks" else "HTTP-прокси",
-            [
-                ("add", "Создать пользователя"),
-                ("list", "Список"),
-                ("reveal", "Показать пароль"),
-                ("allow", "Разрешить IP"),
-                ("delete", "Удалить"),
-                ("back", "Назад"),
-            ],
-        )
+        options = [
+            ("add", "Создать пользователя"),
+            ("list", "Список"),
+            ("reveal", "Показать пароль"),
+            ("allow", "Разрешить IP"),
+        ]
+        if kind == "socks":
+            options.append(("port", "Смена порта"))
+        options.extend([("delete", "Удалить"), ("back", "Назад")])
+        choice = choose("SOCKS5" if kind == "socks" else "HTTP-прокси", options)
         if choice in {None, "back"}:
             return
         config = stack.store.load()
         listener = config.socks if kind == "socks" else config.http
         if choice == "list":
             _show_until_enter(out, format_user_list(kind, config))
+            continue
+        if choice == "port":
+            _change_socks_port(stack)
             continue
         username = ask_text("Имя пользователя")
         if not username:
@@ -217,3 +219,25 @@ def _users(stack: Stack, kind: str) -> None:
         if choice == "delete" and ask_confirm(f"Удалить {username}?", default=False):
             stack.remove_user(kind, username)
             _show_until_enter(out, "Удалено.")
+
+
+def _change_socks_port(stack: Stack) -> None:
+    out = console()
+    typed = ask_text("Новый порт SOCKS5")
+    if not typed:
+        return
+    try:
+        warnings = stack.set_socks_port(typed)
+    except ProxyCLIError as exc:
+        out.print(f"Ошибка: {exc}", markup=False, highlight=False)
+        if exc.fix:
+            out.print(f"Что сделать: {exc.fix}", markup=False, highlight=False)
+        pause()
+        return
+    for warning in warnings:
+        out.print(warning, markup=False, highlight=False)
+    fresh = stack.store.load()
+    host = fresh.public_ipv4 or "SERVER_IP"
+    username = fresh.socks.users[0].username if fresh.socks.users else "USER"
+    out.print(socks_example(host, fresh.socks.port, username), markup=False, highlight=False)
+    pause()

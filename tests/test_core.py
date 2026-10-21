@@ -9,7 +9,12 @@ import pytest
 from proxycli.cli import main
 from proxycli.constants import CADDY_IMAGE, DOCKER_CE_VERSION, THREEPROXY_IMAGE
 from proxycli.errors import ProbeError, ProxyCLIError, RollbackError, ValidationError
-from proxycli.managers.firewall import command_is_unsafe, plan_apply, plan_rollback
+from proxycli.managers.firewall import (
+    command_is_unsafe,
+    plan_apply,
+    plan_replace_owned_port,
+    plan_rollback,
+)
 from proxycli.managers.stack import Stack
 from proxycli.models.config import AppConfig, Listener, ProxyUser, Route
 from proxycli.services.caddyfile import render_caddyfile
@@ -819,6 +824,290 @@ def test_socks_allow_recreates_proxy_and_rolls_back(layout, monkeypatch):
     assert len(recreates) == 2
 
 
+def _socks_port_config() -> tuple[AppConfig, str]:
+    config, secret = _grafana_allow_config()
+    config.wildcard_domain = "hooks.example.com"
+    config.http = Listener(
+        enabled=True,
+        port=3128,
+        allowlist=["192.0.2.10"],
+        users=[ProxyUser("bob", "http:bob")],
+    )
+    return config, secret
+
+
+def _save_socks_port(stack, config: AppConfig, secret: str) -> bytes:
+    stack.store.save(config)
+    stack.store.save_secrets(
+        {"socks:grafana": secret, "socks:alice": "AlicePassword1", "http:bob": "HttpProxySecret1"}
+    )
+    return stack.layout.secrets_file.read_bytes()
+
+
+def test_socks_port_updates_render_and_keeps_users(stack, capsys):
+    from proxycli.doctor import run_doctor
+
+    config, secret = _socks_port_config()
+    before = _save_socks_port(stack, config, secret)
+    assert main(["socks", "port", "18443"]) == 0
+    loaded = stack.store.load()
+    assert loaded.socks.port == 18443
+    assert loaded.http.port == 3128
+    assert loaded.socks.allowlist == ["203.0.113.10", "198.51.100.20"]
+    assert [user.username for user in loaded.socks.users] == ["grafana", "alice"]
+    assert [user.secret_ref for user in loaded.socks.users] == ["socks:grafana", "socks:alice"]
+    text = stack.layout.proxy_cfg.read_text(encoding="utf-8")
+    assert "socks -p18443 -n -u2" in text
+    assert "socks -p1080" not in text
+    assert "allow grafana,alice 203.0.113.10,198.51.100.20" in text
+    assert "grafana:CL:" in text
+    assert "proxy -p3128 -n -u2" in text
+    compose = stack.layout.compose_file.read_text(encoding="utf-8")
+    assert '0.0.0.0:18443:18443' in compose
+    assert "1080:1080" not in compose
+    assert '0.0.0.0:3128:3128' in compose
+    assert '"80:80"' in compose
+    assert '"443:443"' in compose
+    assert stack.layout.secrets_file.read_bytes() == before
+    assert stack.store.load_secrets()["socks:grafana"] == secret
+    captured = capsys.readouterr()
+    assert "socks5://grafana:****@203.0.113.8:18443" in captured.out
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert secret not in stack.layout.config_file.read_text(encoding="utf-8")
+    assert secret not in stack.layout.events_file.read_text(encoding="utf-8")
+    assert "18443" in plain_status(stack)
+    report = "\n".join(stack.inspect_acl("socks"))
+    assert "port=18443" in report
+    assert "socks -p18443" in report
+    assert secret not in report
+    doctor = " ".join(item.detail for item in run_doctor(stack, timeout=1))
+    assert "18443" in doctor
+    assert secret not in doctor
+
+
+def test_socks_port_rejects_invalid_and_conflicts(stack):
+    config, secret = _socks_port_config()
+    before = _save_socks_port(stack, config, secret)
+    for bad in ("0", "65536", "-1", "abc", "80", "443", "22", "3128", "18443;id"):
+        assert main(["socks", "port", bad]) == 2
+    assert stack.store.load().socks.port == 1080
+    assert stack.store.load().socks.allowlist == ["203.0.113.10", "198.51.100.20"]
+    assert stack.layout.secrets_file.read_bytes() == before
+    loaded = stack.store.load()
+    loaded.http.port = 8080
+    stack.store.save(loaded)
+    assert main(["socks", "port", "8080"]) == 2
+    assert stack.store.load().socks.port == 1080
+    assert stack.store.load().http.port == 8080
+
+
+def test_socks_port_recreate_failure_restores_mapping(layout, monkeypatch):
+    class _Runner:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def __call__(self, argv: list[str], timeout: float = 30) -> ProcResult:
+            self.calls.append(list(argv))
+            if "--force-recreate" in argv and "proxy3" in argv and not getattr(self, "failed", False):
+                self.failed = True
+                return ProcResult(1, "", "recreate failed")
+            if argv[:2] == ["docker", "inspect"]:
+                return ProcResult(0, "running\n", "")
+            return ProcResult(0, "", "")
+
+    runner = _Runner()
+    stack = _online_stack(layout, monkeypatch, runner)
+    config, secret = _socks_port_config()
+    before = _save_socks_port(stack, config, secret)
+    with pytest.raises(ProxyCLIError) as caught:
+        stack.set_socks_port(18443)
+    assert "recreate failed" in str(caught.value)
+    assert "Файлы возвращены" in str(caught.value)
+    loaded = stack.store.load()
+    assert loaded.socks.port == 1080
+    assert loaded.socks.allowlist == ["203.0.113.10", "198.51.100.20"]
+    assert [user.username for user in loaded.socks.users] == ["grafana", "alice"]
+    cfg = stack.layout.proxy_cfg.read_text(encoding="utf-8")
+    compose = stack.layout.compose_file.read_text(encoding="utf-8")
+    assert "socks -p1080 -n -u2" in cfg
+    assert "socks -p18443" not in cfg
+    assert "0.0.0.0:1080:1080" in compose
+    assert "18443:18443" not in compose
+    assert "0.0.0.0:3128:3128" in compose
+    assert stack.layout.secrets_file.read_bytes() == before
+    assert all(call[0] != "nft" for call in runner.calls)
+    recreates = [call for call in runner.calls if "--force-recreate" in call and "proxy3" in call]
+    assert len(recreates) == 2
+
+
+def _owned_ruleset() -> dict:
+    def rule(handle: int, comment: str) -> dict:
+        return {
+            "rule": {
+                "family": "inet",
+                "table": "filter",
+                "chain": "input",
+                "handle": handle,
+                "comment": comment,
+            }
+        }
+
+    return {
+        "nftables": [
+            rule(4, "allow-ssh"),
+            rule(7, "proxycli-tcp-80"),
+            rule(8, "proxycli-tcp-443"),
+            rule(12, "proxycli-udp-443"),
+            rule(9, "proxycli-tcp-1080"),
+            rule(10, "proxycli-tcp-3128"),
+        ]
+    }
+
+
+class _NftPortRunner:
+    def __init__(self, ruleset: dict, *, fail_delete_handle: str = "", fail_insert: bool = False) -> None:
+        self.ruleset = ruleset
+        self.calls: list[list[str]] = []
+        self.fail_delete_handle = fail_delete_handle
+        self.fail_insert = fail_insert
+        self._handle = 100
+
+    def __call__(self, argv: list[str], timeout: float = 30) -> ProcResult:
+        self.calls.append(list(argv))
+        if "flush" in argv:
+            return ProcResult(1, "", "flush refused")
+        if argv[:3] == ["nft", "-j", "list"]:
+            return ProcResult(0, json.dumps(self.ruleset), "")
+        if argv[:3] == ["nft", "insert", "rule"]:
+            if self.fail_insert:
+                return ProcResult(1, "", "insert failed")
+            comment = argv[argv.index("comment") + 1]
+            self.ruleset["nftables"].append(
+                {
+                    "rule": {
+                        "family": argv[3],
+                        "table": argv[4],
+                        "chain": argv[5],
+                        "handle": self._handle,
+                        "comment": comment,
+                    }
+                }
+            )
+            self._handle += 1
+            return ProcResult(0, "", "")
+        if argv[:3] == ["nft", "delete", "rule"]:
+            handle = argv[argv.index("handle") + 1]
+            if handle == self.fail_delete_handle:
+                return ProcResult(1, "", "delete failed")
+            self.ruleset["nftables"] = [
+                item
+                for item in self.ruleset["nftables"]
+                if str(item.get("rule", {}).get("handle", "")) != handle
+            ]
+            return ProcResult(0, "", "")
+        if argv[:2] == ["docker", "inspect"]:
+            return ProcResult(0, "running\n", "")
+        return ProcResult(0, "", "")
+
+    def comments(self) -> set[str]:
+        found = set()
+        for item in self.ruleset["nftables"]:
+            rule = item.get("rule")
+            if isinstance(rule, dict) and rule.get("comment"):
+                found.add(str(rule["comment"]))
+        return found
+
+
+def test_socks_port_replaces_only_owned_nft_rule(layout, monkeypatch):
+    ruleset = _owned_ruleset()
+    runner = _NftPortRunner(ruleset)
+    stack = _online_stack(layout, monkeypatch, runner)
+    config, secret = _socks_port_config()
+    before = _save_socks_port(stack, config, secret)
+    warnings = stack.set_socks_port("18443")
+    assert any("proxycli-tcp-1080" in item and "18443" in item for item in warnings)
+    assert stack.store.load().socks.port == 18443
+    assert stack.store.load().socks.allowlist == ["203.0.113.10", "198.51.100.20"]
+    assert stack.layout.secrets_file.read_bytes() == before
+    comments = runner.comments()
+    assert "proxycli-tcp-1080" not in comments
+    assert "proxycli-tcp-18443" in comments
+    assert "allow-ssh" in comments
+    assert "proxycli-tcp-80" in comments
+    assert "proxycli-tcp-443" in comments
+    assert "proxycli-udp-443" in comments
+    assert "proxycli-tcp-3128" in comments
+    assert all("flush" not in call for call in runner.calls)
+    assert '"80:80"' in stack.layout.compose_file.read_text(encoding="utf-8")
+    assert "1080:1080" not in stack.layout.compose_file.read_text(encoding="utf-8")
+    recreates = [call for call in runner.calls if "--force-recreate" in call and "proxy3" in call]
+    assert len(recreates) == 1
+
+
+def test_socks_port_nft_failure_restores_port_and_rule(layout, monkeypatch):
+    runner = _NftPortRunner(_owned_ruleset(), fail_delete_handle="9")
+    stack = _online_stack(layout, monkeypatch, runner)
+    config, secret = _socks_port_config()
+    before = _save_socks_port(stack, config, secret)
+    with pytest.raises(ProxyCLIError) as caught:
+        stack.set_socks_port(18443)
+    assert "delete failed" in str(caught.value)
+    assert "Файлы возвращены" in str(caught.value)
+    assert stack.store.load().socks.port == 1080
+    assert stack.layout.secrets_file.read_bytes() == before
+    assert "socks -p1080 -n -u2" in stack.layout.proxy_cfg.read_text(encoding="utf-8")
+    assert "0.0.0.0:1080:1080" in stack.layout.compose_file.read_text(encoding="utf-8")
+    assert "18443:18443" not in stack.layout.compose_file.read_text(encoding="utf-8")
+    comments = runner.comments()
+    assert "proxycli-tcp-1080" in comments
+    assert "proxycli-tcp-18443" not in comments
+    assert "allow-ssh" in comments
+    assert "proxycli-tcp-3128" in comments
+    assert all("flush" not in call for call in runner.calls)
+    recreates = [call for call in runner.calls if "--force-recreate" in call and "proxy3" in call]
+    assert len(recreates) == 2
+
+
+def test_socks_menu_port_shows_endpoint_without_password(stack, monkeypatch, capsys):
+    from proxycli.ui.menu import _users
+
+    config, secret = _grafana_allow_config()
+    stack.store.save(config)
+    stack.store.save_secrets({"socks:grafana": secret, "socks:alice": "AlicePassword1"})
+    before = stack.layout.secrets_file.read_bytes()
+    monkeypatch.setattr("proxycli.ui.menu.pause", lambda: None)
+    prompts: list[str] = []
+    answers = iter(["18443"])
+
+    def choose(title: str, options: list[tuple[str, str]]) -> str:
+        assert ("port", "Смена порта") in options
+        return "port" if not prompts else "back"
+
+    def ask(label: str, default: str = "") -> str:
+        prompts.append(label)
+        return next(answers)
+
+    monkeypatch.setattr("proxycli.ui.menu.choose", choose)
+    monkeypatch.setattr("proxycli.ui.menu.ask_text", ask)
+    _users(stack, "socks")
+    captured = capsys.readouterr()
+    assert prompts == ["Новый порт SOCKS5"]
+    assert "socks5://grafana:****@203.0.113.8:18443" in captured.out
+    assert secret not in captured.out
+    assert secret not in captured.err
+    assert stack.store.load().socks.port == 18443
+    assert stack.store.load().socks.allowlist == ["203.0.113.10", "198.51.100.20"]
+    assert stack.layout.secrets_file.read_bytes() == before
+
+    def choose_http(_title: str, options: list[tuple[str, str]]) -> str:
+        assert ("port", "Смена порта") not in options
+        return "back"
+
+    monkeypatch.setattr("proxycli.ui.menu.choose", choose_http)
+    _users(stack, "http")
+
+
 class _DockerFake:
     """Answers docker inspect/logs/network and iptables like a VPS would."""
 
@@ -1053,6 +1342,18 @@ def test_firewall_is_additive_and_skips_ssh():
     empty, note = plan_apply({"nftables": []}, [("tcp", 80)])
     assert empty == []
     assert "не изменялся" in note
+    ruleset = _owned_ruleset()
+    commands = plan_replace_owned_port(ruleset, "tcp", 1080, 18443)
+    assert commands[0][commands[0].index("dport") + 1] == "18443"
+    assert commands[0][-1] == "proxycli-tcp-18443"
+    assert commands[1] == ["nft", "delete", "rule", "inet", "filter", "input", "handle", "9"]
+    assert all(not command_is_unsafe(item) and "flush" not in item for item in commands)
+    assert plan_replace_owned_port(ruleset, "tcp", 1080, 18443, delete_old=False) == [commands[0]]
+    assert plan_replace_owned_port({"nftables": [ruleset["nftables"][0]]}, "tcp", 1080, 18443) == []
+    with pytest.raises(ValidationError):
+        plan_replace_owned_port(ruleset, "tcp", 1080, 22)
+    with pytest.raises(ValidationError):
+        plan_replace_owned_port(ruleset, "tcp", 80, 18443)
 
 
 def test_doctor_and_status(stack):

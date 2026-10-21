@@ -75,6 +75,84 @@ def plan_apply(ruleset: dict[str, Any], ports: list[PortSpec]) -> tuple[list[lis
     return commands, note
 
 
+def plan_replace_owned_port(
+    ruleset: dict[str, Any],
+    proto: str,
+    old_port: int,
+    new_port: int,
+    *,
+    delete_old: bool = True,
+) -> list[list[str]]:
+    """Replace one proxycli-owned port rule. Other comments are left untouched.
+
+    The new accept rule is inserted before the old one is deleted. If this
+    install never added a rule for the old port, nothing is planned.
+    """
+    if proto not in {"tcp", "udp"}:
+        raise ValidationError("поддерживаются только tcp и udp")
+    if old_port == SSH_PORT or new_port == SSH_PORT:
+        raise ValidationError("ProxyCLI не управляет портом SSH")
+    if new_port in {80, 443} or old_port in {80, 443}:
+        raise ValidationError("правила Caddy для 80 и 443 этой командой не меняются")
+    if old_port == new_port:
+        return []
+    comment_old = f"proxycli-{proto}-{old_port}"
+    comment_new = f"proxycli-{proto}-{new_port}"
+    owned = [rule for rule in _rule_dicts(ruleset) if str(rule.get("comment", "")) == comment_old]
+    if not owned:
+        return []
+    family = str(owned[0].get("family") or "")
+    table = str(owned[0].get("table") or "")
+    chain = str(owned[0].get("chain") or "")
+    if not family or not table or not chain:
+        raise ValidationError(
+            f"правило {comment_old} без family/table/chain, firewall не изменён",
+            fix="nft -a list ruleset",
+        )
+    commands: list[list[str]] = []
+    if comment_new not in _comments(ruleset):
+        commands.append(
+            [
+                "nft",
+                "insert",
+                "rule",
+                family,
+                table,
+                chain,
+                proto,
+                "dport",
+                str(new_port),
+                "accept",
+                "comment",
+                comment_new,
+            ]
+        )
+    if delete_old:
+        for rule in owned:
+            handle = rule.get("handle")
+            if handle is None:
+                raise ValidationError(
+                    f"правило {comment_old} без handle, удалять его нельзя",
+                    fix="nft -a list ruleset",
+                )
+            commands.append(
+                [
+                    "nft",
+                    "delete",
+                    "rule",
+                    str(rule.get("family") or family),
+                    str(rule.get("table") or table),
+                    str(rule.get("chain") or chain),
+                    "handle",
+                    str(handle),
+                ]
+            )
+    for command in commands:
+        if command_is_unsafe(command) or "flush" in command or "ruleset" in command:
+            raise ValidationError("отказ: смена порта затронула бы SSH или сделала бы flush")
+    return commands
+
+
 def plan_rollback(ruleset: dict[str, Any]) -> list[list[str]]:
     commands: list[list[str]] = []
     for item in ruleset.get("nftables", []):
@@ -137,11 +215,15 @@ def _prefer(chains: list[tuple[str, str, str]]) -> tuple[str, str, str]:
 
 
 def _comments(ruleset: dict[str, Any]) -> set[str]:
-    found: set[str] = set()
+    return {str(rule["comment"]) for rule in _rule_dicts(ruleset) if rule.get("comment")}
+
+
+def _rule_dicts(ruleset: dict[str, Any]) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
     for item in ruleset.get("nftables", []):
         if not isinstance(item, dict):
             continue
         rule = item.get("rule")
-        if isinstance(rule, dict) and rule.get("comment"):
-            found.add(str(rule["comment"]))
+        if isinstance(rule, dict):
+            found.append(rule)
     return found

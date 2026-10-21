@@ -15,6 +15,7 @@ from proxycli.constants import (
 )
 from proxycli.errors import ProbeError, ProxyCLIError, RollbackError, ValidationError
 from proxycli.managers.backup import BackupManager
+from proxycli.managers.firewall import command_is_unsafe, parse_ruleset, plan_replace_owned_port
 from proxycli.models.config import AppConfig, ProxyUser, Route
 from proxycli.services import proxyacl
 from proxycli.services.caddyfile import (
@@ -390,6 +391,96 @@ class Stack:
         warnings = self.transaction(f"{kind}-configure", mutate, probe=False)
         self.events.write(f"{kind}.configure")
         return warnings
+
+    def set_socks_port(self, port: int | str) -> list[str]:
+        """Change the SOCKS listen port only. Users, secrets, and allowlist stay."""
+        new_port = validate_port(port, kind="socks")
+        current = self.store.load()
+        if new_port == current.http.port:
+            raise ValidationError(
+                f"порт {new_port} занят HTTP-прокси",
+                fix="выберите порт кроме порта HTTP-прокси, 80, 443 и 22",
+            )
+        old_port = current.socks.port
+        if new_port == old_port:
+            return [f"Порт SOCKS5 уже {new_port}. Пароль и allowlist не менялись."]
+
+        def mutate() -> None:
+            config = self.store.load()
+            if new_port == config.http.port:
+                raise ValidationError(
+                    f"порт {new_port} занят HTTP-прокси",
+                    fix="выберите порт кроме порта HTTP-прокси, 80, 443 и 22",
+                )
+            config.socks.port = new_port
+            self.store.save(config)
+
+        snap = self.backup.create("socks-port")
+        try:
+            mutate()
+            if not self.offline():
+                # Compose may publish the new port before force-recreate returns.
+                # A later failure must put the previous mapping back.
+                self._proxy_restarted = True
+            warnings = self.reload(probe=False, restart_proxy=True)
+            warnings.append(self._retarget_owned_firewall(old_port, new_port))
+        except Exception as exc:
+            self._rollback(snap, exc, reason="socks-port")
+            raise
+        self.events.write("socks.port", port=new_port)
+        warnings.append(f"Порт SOCKS5: {new_port}. Пароль и allowlist не менялись.")
+        return warnings
+
+    def _retarget_owned_firewall(self, old_port: int, new_port: int) -> str:
+        """Move a proxycli-owned SOCKS accept rule. Never flushes the ruleset."""
+        if self.offline():
+            return "firewall не проверялся (offline), правила не менялись"
+        try:
+            listed = self.runner(["nft", "-j", "list", "ruleset"], timeout=15)
+        except ProxyCLIError:
+            return "nftables недоступен, правила не менялись"
+        if not listed.ok:
+            return "nftables недоступен, правила не менялись"
+        ruleset = parse_ruleset(listed.stdout)
+        delete_old = old_port != self.store.load().http.port
+        commands = plan_replace_owned_port(
+            ruleset, "tcp", old_port, new_port, delete_old=delete_old
+        )
+        if not commands:
+            return "правила proxycli для прежнего порта SOCKS5 не найдены, чужой firewall не менялся"
+        applied = False
+        try:
+            for command in commands:
+                if command_is_unsafe(command) or "flush" in command or "ruleset" in command:
+                    raise ProxyCLIError("отказ: команда затронула бы SSH или сделала бы flush")
+                require_ok(self.runner(command, timeout=15), command)
+                applied = True
+        except Exception:
+            if applied:
+                self._revert_firewall_port(new_port, old_port)
+            raise
+        if delete_old:
+            return f"правило proxycli-tcp-{old_port} заменено на proxycli-tcp-{new_port}"
+        return (
+            f"правило proxycli-tcp-{new_port} добавлено, "
+            f"правило порта {old_port} оставлено: им пользуется HTTP-прокси"
+        )
+
+    def _revert_firewall_port(self, drop_port: int, keep_port: int) -> None:
+        listed = self.runner(["nft", "-j", "list", "ruleset"], timeout=15)
+        if not listed.ok:
+            raise ProxyCLIError("не удалось перечитать nftables для отката правила")
+        commands = plan_replace_owned_port(parse_ruleset(listed.stdout), "tcp", drop_port, keep_port)
+        try:
+            for command in commands:
+                if command_is_unsafe(command) or "flush" in command or "ruleset" in command:
+                    raise ProxyCLIError("отказ откатывать firewall опасной командой")
+                require_ok(self.runner(command, timeout=15), command)
+        except Exception as exc:
+            raise ProxyCLIError(
+                f"откат правила firewall не удался: {exc}",
+                fix="nft -a list ruleset",
+            ) from exc
 
     def allow_source(self, kind: str, username: str, cidr: str) -> list[str]:
         """Append one client IP or CIDR. Does not rotate or read the password."""

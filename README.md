@@ -127,7 +127,14 @@ sudo proxycli socks reveal --username alice --i-understand
 sudo proxycli socks example --username alice
 sudo proxycli socks allow --user alice --cidr 203.0.113.10
 sudo proxycli socks inspect-acl --source 203.0.113.10
+sudo proxycli socks port 18443
 ```
+
+`socks port` меняет только порт SOCKS5. Пользователи, пароли и allowlist
+остаются, публикация старого порта снимается, контейнер 3proxy пересоздаётся.
+Порты HTTP-прокси, Caddy 80/443 и SSH не меняются. Если для старого порта есть
+правило nftables с меткой proxycli, оно заменяется; чужой firewall не
+сбрасывается.
 
 Allowlist общий для всех пользователей одного прокси: логин и пароль
 нужны всегда, адрес клиента должен входить в список. `inspect-acl` без

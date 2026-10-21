@@ -34,7 +34,7 @@ def plain_status(stack: object) -> str:
             f"Домен: {domain}",
             f"TLS: {tls}, DNS-плагин готов: {ready}",
             f"Маршрутов: {len(config.routes)}",
-            f"SOCKS5 пользователей: {len(config.socks.users)}",
+            f"SOCKS5: порт {config.socks.port}, пользователей: {len(config.socks.users)}",
             f"HTTP пользователей: {len(config.http.users)}",
         ]
     )

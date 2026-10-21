@@ -99,7 +99,11 @@ def _config(stack: Stack) -> CheckResult:
             "модуль Cloudflare не подтверждён",
             "proxycli settings prepare-dns",
         )
-    return CheckResult("Конфигурация", "ok", f"{len(config.routes)} маршрутов, домен {config.wildcard_domain}")
+    return CheckResult(
+        "Конфигурация",
+        "ok",
+        f"{len(config.routes)} маршрутов, домен {config.wildcard_domain}, SOCKS5 порт {config.socks.port}",
+    )
 
 
 def _secrets(stack: Stack) -> CheckResult:
@@ -164,7 +168,8 @@ def _ports(stack: Stack) -> CheckResult:
             closed.append(str(port))
     if closed:
         return CheckResult("Порты", "fail", "не слушаются: " + ", ".join(closed), "процесс не привязан к порту", "docker ps")
-    return CheckResult("Порты", "ok", "локальные порты отвечают")
+    listened = ", ".join(str(port) for port in targets)
+    return CheckResult("Порты", "ok", f"локальные порты отвечают: {listened}")
 
 
 def _firewall(stack: Stack) -> CheckResult:
@@ -251,16 +256,30 @@ def _upstreams(stack: Stack, timeout: float) -> CheckResult:
 def _socks(stack: Stack, timeout: float) -> CheckResult:
     config = stack.store.load()
     if not (config.socks.enabled and config.socks.users):
-        return CheckResult("SOCKS5", "skip", "не включён")
+        return CheckResult("SOCKS5", "skip", f"не включён, порт {config.socks.port}")
     if stack.offline():
-        return _skip("SOCKS5")
+        skipped = _skip("SOCKS5")
+        skipped.detail = f"порт {config.socks.port}; {skipped.detail}"
+        return skipped
     try:
         rejected = socks5_noauth_rejected("127.0.0.1", config.socks.port, min(timeout, 3))
     except ProbeError as exc:
-        return CheckResult("SOCKS5", "fail", exc.message, "порт не прошёл рукопожатие", exc.fix)
+        return CheckResult(
+            "SOCKS5",
+            "fail",
+            f"порт {config.socks.port}: {exc.message}",
+            "порт не прошёл рукопожатие",
+            exc.fix,
+        )
     if not rejected:
-        return CheckResult("SOCKS5", "fail", "анонимный вход принят", "auth none или allow *", "перегенерируйте 3proxy, пароль обязателен")
-    return CheckResult("SOCKS5", "ok", "анонимный метод отклонён")
+        return CheckResult(
+            "SOCKS5",
+            "fail",
+            f"порт {config.socks.port}: анонимный вход принят",
+            "auth none или allow *",
+            "перегенерируйте 3proxy, пароль обязателен",
+        )
+    return CheckResult("SOCKS5", "ok", f"порт {config.socks.port}, анонимный метод отклонён")
 
 
 def _http(stack: Stack, timeout: float) -> CheckResult:
